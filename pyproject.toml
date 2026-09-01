@@ -1,0 +1,13 @@
+[project]
+name = "satscaling"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "jax>=0.11.1",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.2",
+    "optax>=0.2.8",
+    "pytest>=9.1.1",
+    "tqdm>=4.70.0",
+]
