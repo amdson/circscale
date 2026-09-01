@@ -49,6 +49,9 @@ class RunConfig:
     model_seed: int = 0
     data_seed: int | None = None  # None -> model_seed (vary init AND data order)
     eval_seed: int = 1            # keep fixed across the whole sweep
+    # loss restriction: train only on these output wires (None = all 256).
+    # Eval still records every output, so incidental learning is visible.
+    output_wires: tuple | None = None
     # eval / io
     eval_every: int = 500
     eval_n: int = 4000
@@ -60,6 +63,8 @@ class RunConfig:
         s = f"w{self.width}_d{self.mlp_depth}_b{self.batch}_lr{self.lr:g}_s{self.steps}"
         if self.schedule != "constant":
             s += f"_{self.schedule}"
+        if self.output_wires is not None:
+            s += "_ow" + "-".join(map(str, self.output_wires))
         return s + f"_cs{self.circuit_seed}_ms{self.model_seed}"
 
     @property
@@ -112,6 +117,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         width=cfg.width, depth=cfg.mlp_depth, hidden_ratio=cfg.hidden_ratio,
     )
     opt = optax.adam(_make_schedule(cfg))
+    wire_mask = None if cfg.output_wires is None else jnp.asarray(cfg.output_wires)
     data_key = jax.random.key(cfg.model_seed if cfg.data_seed is None else cfg.data_seed)
 
     if cfg.ckpt_path.exists():
@@ -137,9 +143,11 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         key = jax.random.fold_in(data_key, step)
         x = jax.random.bernoulli(key, shape=(cfg.batch, cfg.n_wires)).astype(jnp.uint8)
         y = circ_eval(x).astype(jnp.float32)
-        loss, grads = jax.value_and_grad(
-            lambda p: jnp.mean(per_output_bce(forward(p, x), y))
-        )(params)
+        def loss_fn(p):
+            pol = per_output_bce(forward(p, x), y)
+            return jnp.mean(pol if wire_mask is None else pol[wire_mask])
+
+        loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, opt_state = opt.update(grads, opt_state)
         return optax.apply_updates(params, updates), opt_state, loss
 
@@ -221,6 +229,7 @@ def main():
         ("model_seed", int), ("data_seed", int), ("eval_seed", int),
         ("eval_every", int), ("eval_n", int), ("checkpoint_every", int),
         ("out_dir", str),
+        ("output_wires", lambda s: tuple(int(x) for x in s.split(","))),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)

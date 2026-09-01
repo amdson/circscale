@@ -96,6 +96,14 @@ grid rather than replicates; add seeds to `sweep.SEEDS` later if needed).
 read at call time, so notebooks can override them before invoking the
 stages. `train.load_run(path)` -> (config, arrays) for analysis.
 
+## Solo-output grokking (`solo_grokking.ipynb`)
+
+Trains on a single output wire at a time (`RunConfig.output_wires` masks the
+loss; eval still records all 256 outputs) and compares each wire's solo
+trajectory and transition time against the multi-task run — step vs power
+law, transfer from multi-task curricula, and pure-parity controls (wires 42,
+5). Colab-aware, resumable, ~16 runs x ~6 GPU-min at defaults.
+
 ## Colab (`colab_sweep.ipynb`)
 
 Runs the entire sweep on a Colab GPU (~30-60 min on a T4): installs CUDA
