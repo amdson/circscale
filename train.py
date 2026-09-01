@@ -17,6 +17,7 @@ import json
 import os
 import pickle
 import time
+import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from tqdm.auto import tqdm
 
 from mlp import MLPConfig, forward, init_params, per_output_bce
 from random_circuit import make_jax_evaluator, sample_circuit
+from tree_circuit import make_tree_evaluator, sample_tree_circuit
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,7 @@ class RunConfig:
     optimizer: str = "adam"     # "adam" | "adamw"
     weight_decay: float = 0.0   # adamw only
     # circuit / seeds
+    task: str = "brickwork"  # "brickwork" | "tree3" (n_wires = 3^circ_depth leaves)
     n_wires: int = 256
     circ_depth: int = 32
     circuit_seed: int = 0
@@ -67,10 +70,15 @@ class RunConfig:
             s += f"_{self.schedule}"
         if self.optimizer != "adam":
             s += f"_{self.optimizer}wd{self.weight_decay:g}"
+        if self.task != "brickwork":
+            s += f"_{self.task}"
         if (self.n_wires, self.circ_depth) != (256, 32):
             s += f"_c{self.n_wires}x{self.circ_depth}"
         if self.output_wires is not None:
-            s += "_ow" + "-".join(map(str, self.output_wires))
+            ow = "-".join(map(str, self.output_wires))
+            if len(self.output_wires) > 12:
+                ow = f"{len(self.output_wires)}x{zlib.crc32(ow.encode()):08x}"
+            s += f"_ow{ow}"
         return s + f"_cs{self.circuit_seed}_ms{self.model_seed}"
 
     @property
@@ -123,12 +131,19 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         return cfg.npz_path
     Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
 
-    circuit = sample_circuit(
-        np.random.default_rng(cfg.circuit_seed), cfg.n_wires, cfg.circ_depth
-    )
-    circ_eval = make_jax_evaluator(circuit)
+    crng = np.random.default_rng(cfg.circuit_seed)
+    if cfg.task == "tree3":
+        circuit = sample_tree_circuit(crng, cfg.n_wires, cfg.circ_depth)
+        circ_eval = make_tree_evaluator(circuit)
+        n_out = circuit.n_interior
+    elif cfg.task == "brickwork":
+        circuit = sample_circuit(crng, cfg.n_wires, cfg.circ_depth)
+        circ_eval = make_jax_evaluator(circuit)
+        n_out = cfg.n_wires
+    else:
+        raise ValueError(f"unknown task {cfg.task!r}")
     mlp_cfg = MLPConfig(
-        n_inputs=cfg.n_wires, n_outputs=cfg.n_wires,
+        n_inputs=cfg.n_wires, n_outputs=n_out,
         width=cfg.width, depth=cfg.mlp_depth, hidden_ratio=cfg.hidden_ratio,
     )
     opt = _make_opt(cfg)
@@ -245,7 +260,7 @@ def main():
         ("eval_every", int), ("eval_n", int), ("checkpoint_every", int),
         ("out_dir", str),
         ("output_wires", lambda s: tuple(int(x) for x in s.split(","))),
-        ("optimizer", str), ("weight_decay", float),
+        ("optimizer", str), ("weight_decay", float), ("task", str),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)

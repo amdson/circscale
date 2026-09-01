@@ -112,6 +112,16 @@ are tagged `_c256x5` so tasks never mix): a saturation-regime task where a
 modulo a few pure-parity outputs that may stay at chance. Includes a
 saturation check and a stuck-output Fourier diagnosis.
 
+## Tree circuit (`tree_circuit.py`, `tree_taps.ipynb`)
+
+Random fan-in-3 tree over 2187 inputs (1093 interior wires, exactly balanced
+via disjoint subtree supports). `tree_taps.ipynb` taps interior wires i.i.d.
+with probability q and trains only on the tapped set (`task="tree3"` in
+RunConfig): supervision density becomes the difficulty-distribution dial —
+q=1 gives a full process-supervision cascade, sparse q gives
+percolation-distributed supervision gaps (`supervision_gaps`), with the
+prediction that per-node cost is exponential in gap, not depth.
+
 ## Colab (`colab_sweep.ipynb`)
 
 Runs the entire sweep on a Colab GPU (~30-60 min on a T4): installs CUDA
