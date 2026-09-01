@@ -42,6 +42,8 @@ class RunConfig:
     lr: float = 1e-3
     warmup: int = 500
     schedule: str = "constant"  # "constant" (honest mid-run L(N,D) points) or "cosine"
+    optimizer: str = "adam"     # "adam" | "adamw"
+    weight_decay: float = 0.0   # adamw only
     # circuit / seeds
     n_wires: int = 256
     circ_depth: int = 32
@@ -63,6 +65,8 @@ class RunConfig:
         s = f"w{self.width}_d{self.mlp_depth}_b{self.batch}_lr{self.lr:g}_s{self.steps}"
         if self.schedule != "constant":
             s += f"_{self.schedule}"
+        if self.optimizer != "adam":
+            s += f"_{self.optimizer}wd{self.weight_decay:g}"
         if self.output_wires is not None:
             s += "_ow" + "-".join(map(str, self.output_wires))
         return s + f"_cs{self.circuit_seed}_ms{self.model_seed}"
@@ -88,6 +92,15 @@ def _make_schedule(cfg: RunConfig):
             0.0, cfg.lr, cfg.warmup, cfg.steps, end_value=0.1 * cfg.lr
         )
     raise ValueError(f"unknown schedule {cfg.schedule!r}")
+
+
+def _make_opt(cfg: RunConfig):
+    sched = _make_schedule(cfg)
+    if cfg.optimizer == "adam":
+        return optax.adam(sched)
+    if cfg.optimizer == "adamw":
+        return optax.adamw(sched, weight_decay=cfg.weight_decay)
+    raise ValueError(f"unknown optimizer {cfg.optimizer!r}")
 
 
 def _save_ckpt(path: Path, state: dict) -> None:
@@ -116,7 +129,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         n_inputs=cfg.n_wires, n_outputs=cfg.n_wires,
         width=cfg.width, depth=cfg.mlp_depth, hidden_ratio=cfg.hidden_ratio,
     )
-    opt = optax.adam(_make_schedule(cfg))
+    opt = _make_opt(cfg)
     wire_mask = None if cfg.output_wires is None else jnp.asarray(cfg.output_wires)
     data_key = jax.random.key(cfg.model_seed if cfg.data_seed is None else cfg.data_seed)
 
@@ -148,7 +161,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
             return jnp.mean(pol if wire_mask is None else pol[wire_mask])
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
-        updates, opt_state = opt.update(grads, opt_state)
+        updates, opt_state = opt.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), opt_state, loss
 
     eval_x = jax.random.bernoulli(
@@ -230,6 +243,7 @@ def main():
         ("eval_every", int), ("eval_n", int), ("checkpoint_every", int),
         ("out_dir", str),
         ("output_wires", lambda s: tuple(int(x) for x in s.split(","))),
+        ("optimizer", str), ("weight_decay", float),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)

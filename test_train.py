@@ -49,3 +49,10 @@ def test_output_wires_mask(tmp_path):
     loaded_cfg, d = load_run(path)
     assert loaded_cfg["output_wires"] == [3, 7]
     assert d["per_out_loss"].shape[1] == 32  # eval still covers every output
+
+
+def test_adamw_option(tmp_path):
+    cfg = tiny_cfg(tmp_path, optimizer="adamw", weight_decay=1e-2)
+    assert "_adamwwd0.01_" in cfg.name
+    path = run(cfg, quiet=True)
+    assert load_run(path)[0]["weight_decay"] == 1e-2
