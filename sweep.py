@@ -10,10 +10,11 @@ point loses at most `checkpoint_every` steps.
 Every eval checkpoint of every run is an (N, D=batch*step, loss) datapoint;
 the constant-LR schedule keeps mid-run points honest.
 
-Width is the single scale axis at fixed MLP depth, leaning on Kaplan-style
-shape-insensitivity (loss depends strongly on N, weakly on aspect ratio). If
-per-tap-depth curves later suggest a depth ceiling, add an iso-parameter
-shape arm ((512,1)..(128,16) at ~2.1M trunk params) to check.
+N scales Kaplan-style: width and depth grow together (depth ~ sqrt(width),
+aspect ratio stays in a sane band), leaning on shape-insensitivity rather
+than a tuned aspect ratio. GRID/SEEDS (and LR_GRID, *_STEPS, BATCH) are
+module globals read at call time, so a notebook can override them:
+`import sweep; sweep.GRID = [...]` before running the stages.
 """
 
 from __future__ import annotations
@@ -27,9 +28,8 @@ import numpy as np
 
 from train import RunConfig, run
 
-# --- vary width at fixed depth ---
-WIDTHS = [32, 64, 128, 256, 512]
-MLP_DEPTH = 4
+# --- scale grid: (width, mlp_depth), depth ~ sqrt(width) ---
+GRID = [(32, 2), (64, 3), (128, 4), (256, 6), (512, 8)]
 SEEDS = {32: [0, 1, 2], 64: [0, 1, 2], 128: [0, 1, 2], 256: [0, 1], 512: [0]}
 
 LR_GRID = [3e-4, 1e-3, 3e-3]
@@ -43,7 +43,7 @@ LR_TABLE = Path("runs/lr_table.json")
 
 
 def all_shapes() -> list[tuple[int, int]]:
-    return [(w, MLP_DEPTH) for w in WIDTHS]
+    return list(GRID)
 
 
 def key(width: int, depth: int) -> str:
@@ -109,10 +109,10 @@ def stage_lr_tune():
 
 def stage_main():
     table = read_lr_table()
-    for width in WIDTHS:
-        lr = _tuned_lr(table, width, MLP_DEPTH)
-        for seed in SEEDS[width]:
-            run(main_cfg(width, MLP_DEPTH, lr, seed))
+    for width, depth in GRID:
+        lr = _tuned_lr(table, width, depth)
+        for seed in SEEDS.get(width, [0]):
+            run(main_cfg(width, depth, lr, seed))
 
 
 def stage_status():
@@ -143,7 +143,7 @@ def stage_status():
             )
             print(f"  {key(width, depth):<9} lr={lr if lr is not None else '?'}  {marks}")
 
-    show("main", all_shapes(), lambda w: SEEDS[w])
+    show("main", all_shapes(), lambda w: SEEDS.get(w, [0]))
 
 
 if __name__ == "__main__":

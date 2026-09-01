@@ -88,12 +88,12 @@ uv run python sweep.py main      # 50k-step runs, widths 32-512 (~2-3 h CPU)
 uv run python sweep.py status    # done / ckpt@step / pending
 ```
 
-Grid (edit constants atop `sweep.py`): width is the single scale axis,
-{32..512} at fixed MLP depth 4 (3 seeds small, down to 1 at w512), leaning on
-Kaplan-style shape-insensitivity for aspect ratio; if per-tap-depth curves
-later suggest a model-depth ceiling, add an iso-param width-vs-depth arm.
-Both init and data order vary with the seed. `train.load_run(path)` ->
-(config, arrays) for analysis.
+Grid: Kaplan-style co-scaling of width and depth (depth ~ sqrt(width)) —
+(32,2), (64,3), (128,4), (256,6), (512,8), trunk params ~16k -> ~17M, 3
+seeds small down to 1 at the top; both init and data order vary with the
+seed. `sweep.GRID`/`sweep.SEEDS` (and LR_GRID, *_STEPS, BATCH) are module
+globals read at call time, so notebooks can override them before invoking
+the stages. `train.load_run(path)` -> (config, arrays) for analysis.
 
 ## Colab (`colab_sweep.ipynb`)
 
