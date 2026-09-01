@@ -1071,6 +1071,7 @@ dependencies = [
     { name = "numpy" },
     { name = "optax" },
     { name = "pytest" },
+    { name = "scipy" },
     { name = "tqdm" },
 ]
 
@@ -1082,6 +1083,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.5.2" },
     { name = "optax", specifier = ">=0.2.8" },
     { name = "pytest", specifier = ">=9.1.1" },
+    { name = "scipy", specifier = ">=1.18.1" },
     { name = "tqdm", specifier = ">=4.70.0" },
 ]
 
