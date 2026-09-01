@@ -67,6 +67,8 @@ class RunConfig:
             s += f"_{self.schedule}"
         if self.optimizer != "adam":
             s += f"_{self.optimizer}wd{self.weight_decay:g}"
+        if (self.n_wires, self.circ_depth) != (256, 32):
+            s += f"_c{self.n_wires}x{self.circ_depth}"
         if self.output_wires is not None:
             s += "_ow" + "-".join(map(str, self.output_wires))
         return s + f"_cs{self.circuit_seed}_ms{self.model_seed}"

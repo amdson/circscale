@@ -104,6 +104,14 @@ trajectory and transition time against the multi-task run — step vs power
 law, transfer from multi-task curricula, and pure-parity controls (wires 42,
 5). Colab-aware, resumable, ~16 runs x ~6 GPU-min at defaults.
 
+## Easy circuit (`easy_circuit.ipynb`)
+
+Same generator with tap depths capped at 5 (`RunConfig.circ_depth=5`; runs
+are tagged `_c256x5` so tasks never mix): a saturation-regime task where a
+~17M model at 100k steps should come close to solving all 256 outputs,
+modulo a few pure-parity outputs that may stay at chance. Includes a
+saturation check and a stuck-output Fourier diagnosis.
+
 ## Colab (`colab_sweep.ipynb`)
 
 Runs the entire sweep on a Colab GPU (~30-60 min on a T4): installs CUDA
