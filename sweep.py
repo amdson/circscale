@@ -28,9 +28,12 @@ import numpy as np
 
 from train import RunConfig, run
 
-# --- scale grid: (width, mlp_depth), depth ~ sqrt(width) ---
-GRID = [(32, 2), (64, 3), (128, 4), (256, 6), (512, 8)]
-SEEDS = {32: [0, 1, 2], 64: [0, 1, 2], 128: [0, 1, 2], 256: [0, 1], 512: [0]}
+# --- scale grid: (width, mlp_depth), depth ~ sqrt(width), half-octave width
+# spacing. One seed per shape: run-to-run noise is absorbed by fitting across
+# the finer grid rather than by replicates. ---
+GRID = [(32, 2), (48, 2), (64, 3), (96, 3), (128, 4),
+        (180, 5), (256, 6), (360, 7), (512, 8)]
+SEEDS: dict[int, list[int]] = {}  # width -> seeds; default [0]
 
 LR_GRID = [3e-4, 1e-3, 3e-3]
 TUNE_STEPS = 5_000
