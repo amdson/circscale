@@ -82,9 +82,9 @@ pure function of the step index), and completed runs are skipped, so every
 stage can be interrupted and re-invoked freely.
 
 ```bash
-uv run python sweep.py lr-tune   # 5k-step LR grid {3e-4,1e-3,3e-3} per width
-                                 #   -> runs/tune/ + runs/lr_table.json (~30 min)
-uv run python sweep.py main      # 50k-step runs, widths 32-512 (~2-3 h CPU)
+uv run python sweep.py lr-tune   # 5k-step LR grid {1e-4..1e-2} per shape
+                                 #   -> runs/tune/ + runs/lr_table.json
+uv run python sweep.py main      # 50k-step runs over the scale grid
 uv run python sweep.py status    # done / ckpt@step / pending
 ```
 

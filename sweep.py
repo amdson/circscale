@@ -35,7 +35,7 @@ GRID = [(32, 2), (48, 2), (64, 3), (96, 3), (128, 4),
         (180, 5), (256, 6), (360, 7), (512, 8)]
 SEEDS: dict[int, list[int]] = {}  # width -> seeds; default [0]
 
-LR_GRID = [3e-4, 1e-3, 3e-3]
+LR_GRID = [1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
 TUNE_STEPS = 5_000
 FULL_STEPS = 50_000
 BATCH = 256
