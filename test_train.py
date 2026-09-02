@@ -67,13 +67,22 @@ def test_train_frac(tmp_path):
 
 
 def test_weight_noise(tmp_path):
-    cfg = tiny_cfg(tmp_path, weight_noise=1e-3)
-    assert "_wn0.001_" in cfg.name  # transient is the default
-    persist = tiny_cfg(tmp_path / "persist", weight_noise=1e-3, noise_mode="persist")
-    assert "_wn0.001p_" in persist.name
+    cfg = tiny_cfg(tmp_path, weight_noise=0.1)
+    assert "_wnr0.1_" in cfg.name  # transient + init-relative are the defaults
+    persist = tiny_cfg(tmp_path / "persist", weight_noise=0.1, noise_mode="persist")
+    assert "_wnr0.1p_" in persist.name
+    assert "_wn0.001_" in tiny_cfg(tmp_path, weight_noise=1e-3,
+                                   noise_scale="abs").name
+
+    # init_stds mirrors the param tree (norm scales get no noise)
+    import jax
+    from mlp import MLPConfig, init_params, init_stds
+    mcfg = MLPConfig(n_inputs=32, n_outputs=32, width=32, depth=2)
+    jax.tree_util.tree_map(lambda p, s: None,
+                           init_params(jax.random.key(0), mcfg), init_stds(mcfg))
 
     # noise is step-derived, so interrupt/resume stays exact
-    clean = run(tiny_cfg(tmp_path / "clean", weight_noise=1e-3), quiet=True)
+    clean = run(tiny_cfg(tmp_path / "clean", weight_noise=0.1), quiet=True)
     assert run(cfg, stop_after=25, quiet=True) is None
     resumed = run(cfg, quiet=True)
     _, a = load_run(clean)

@@ -27,7 +27,7 @@ import numpy as np
 import optax
 from tqdm.auto import tqdm
 
-from mlp import MLPConfig, forward, init_params, per_output_bce
+from mlp import MLPConfig, forward, init_params, init_stds, per_output_bce
 from random_circuit import make_jax_evaluator, sample_circuit
 from tree_circuit import make_tree_evaluator, sample_tree_circuit
 
@@ -47,14 +47,19 @@ class RunConfig:
     optimizer: str = "adam"     # "adam" | "adamw" | "sgd"
     weight_decay: float = 0.0   # adamw (decoupled) and sgd (classic L2-style)
     momentum: float = 0.9       # sgd only; 0 = vanilla SGD
-    # Gaussian weight-noise regularizer, std weight_noise (0 disables).
-    # "transient": perturb weights for the forward/backward only, update the
-    #   clean weights — minimizes the Gaussian-smoothed loss (with adamw
-    #   weight decay this is an ELBO with a fixed-variance posterior and
+    # Gaussian weight-noise regularizer (0 disables).
+    # noise_mode — "transient": perturb weights for the forward/backward only,
+    #   update the clean weights (minimizes the Gaussian-smoothed loss; with
+    #   weight decay this is an ELBO with fixed-variance posterior and
     #   Gaussian prior). "persist": add noise into the weights after each
     #   optimizer step (Langevin-style).
+    # noise_scale — "init": weight_noise is a dimensionless ratio; each leaf
+    #   gets std weight_noise * (its init std), keeping the function-space
+    #   perturbation width-invariant (norm scales get none). "abs":
+    #   weight_noise is the raw per-parameter std for every leaf.
     weight_noise: float = 0.0
     noise_mode: str = "transient"  # "transient" | "persist"
+    noise_scale: str = "init"      # "init" | "abs"
     # circuit / seeds
     task: str = "brickwork"  # "brickwork" | "tree3" (n_wires = 3^circ_depth leaves)
     n_wires: int = 256
@@ -87,8 +92,9 @@ class RunConfig:
             s += f"_{self.optimizer}wd{self.weight_decay:g}"
             if self.optimizer == "sgd" and self.momentum != 0.9:
                 s += f"m{self.momentum:g}"
-        if self.weight_noise:  # persist mode tagged with a trailing "p"
-            s += f"_wn{self.weight_noise:g}" + ("p" if self.noise_mode == "persist" else "")
+        if self.weight_noise:  # "wnr" = init-relative, "wn" = absolute; "p" = persist
+            tag = "wnr" if self.noise_scale == "init" else "wn"
+            s += f"_{tag}{self.weight_noise:g}" + ("p" if self.noise_mode == "persist" else "")
         if self.task != "brickwork":
             s += f"_{self.task}"
         if (self.n_wires, self.circ_depth) != (256, 32):
@@ -155,6 +161,8 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     resumes it."""
     if cfg.noise_mode not in ("transient", "persist"):
         raise ValueError(f"unknown noise_mode {cfg.noise_mode!r}")
+    if cfg.noise_scale not in ("init", "abs"):
+        raise ValueError(f"unknown noise_scale {cfg.noise_scale!r}")
     if cfg.npz_path.exists():
         if not quiet:
             print(f"[skip] {cfg.name} (done)")
@@ -180,6 +188,10 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     wire_mask = None if cfg.output_wires is None else jnp.asarray(cfg.output_wires)
     data_key = jax.random.key(cfg.model_seed if cfg.data_seed is None else cfg.data_seed)
     noise_key = jax.random.split(data_key)[0]  # stream independent of the batch keys
+    noise_stds = jax.tree_util.tree_leaves(
+        init_stds(mlp_cfg) if cfg.noise_scale == "init"
+        else jax.tree_util.tree_map(lambda _: 1.0, init_stds(mlp_cfg))
+    )
 
     if cfg.train_frac is not None:
         if cfg.n_wires > 16:
@@ -232,8 +244,8 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
             leaves, tdef = jax.tree_util.tree_flatten(p_tree)
             keys = jax.random.split(jax.random.fold_in(noise_key, step), len(leaves))
             return jax.tree_util.tree_unflatten(tdef, [
-                p + cfg.weight_noise * jax.random.normal(k, p.shape, p.dtype)
-                for p, k in zip(leaves, keys)
+                p + cfg.weight_noise * s * jax.random.normal(k, p.shape, p.dtype)
+                for p, s, k in zip(leaves, noise_stds, keys)
             ])
 
         at = add_noise(params) if cfg.weight_noise and cfg.noise_mode == "transient" \
@@ -346,7 +358,7 @@ def main():
         ("optimizer", str), ("weight_decay", float), ("momentum", float),
         ("task", str),
         ("train_frac", float), ("pool_seed", int),
-        ("weight_noise", float), ("noise_mode", str),
+        ("weight_noise", float), ("noise_mode", str), ("noise_scale", str),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)

@@ -57,6 +57,25 @@ def init_params(key: jax.Array, cfg: MLPConfig) -> dict:
     }
 
 
+def init_stds(cfg: MLPConfig) -> dict:
+    """Per-leaf init stds, mirroring init_params' tree structure.
+
+    Used to scale weight noise in units of each layer's init scale (norm
+    scales are deterministic at init, std 0 — they receive no noise).
+    """
+    hidden = cfg.hidden_ratio * cfg.width
+    return {
+        "embed": cfg.n_inputs ** -0.5,
+        "blocks": {
+            "norm_scale": 0.0,
+            "w1": (2.0 / cfg.width) ** 0.5,
+            "w2": (hidden * cfg.depth) ** -0.5,
+        },
+        "final_norm_scale": 0.0,
+        "head": cfg.width ** -0.5,
+    }
+
+
 def rmsnorm(x: jax.Array, scale: jax.Array, eps: float = 1e-6) -> jax.Array:
     return x * scale * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
 
