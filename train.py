@@ -44,8 +44,9 @@ class RunConfig:
     lr: float = 1e-3
     warmup: int = 500
     schedule: str = "constant"  # "constant" (honest mid-run L(N,D) points) or "cosine"
-    optimizer: str = "adam"     # "adam" | "adamw"
-    weight_decay: float = 0.0   # adamw only
+    optimizer: str = "adam"     # "adam" | "adamw" | "sgd"
+    weight_decay: float = 0.0   # adamw (decoupled) and sgd (classic L2-style)
+    momentum: float = 0.9       # sgd only; 0 = vanilla SGD
     # Gaussian weight-noise regularizer, std weight_noise (0 disables).
     # "transient": perturb weights for the forward/backward only, update the
     #   clean weights — minimizes the Gaussian-smoothed loss (with adamw
@@ -84,6 +85,8 @@ class RunConfig:
             s += f"_{self.schedule}"
         if self.optimizer != "adam":
             s += f"_{self.optimizer}wd{self.weight_decay:g}"
+            if self.optimizer == "sgd" and self.momentum != 0.9:
+                s += f"m{self.momentum:g}"
         if self.weight_noise:  # persist mode tagged with a trailing "p"
             s += f"_wn{self.weight_noise:g}" + ("p" if self.noise_mode == "persist" else "")
         if self.task != "brickwork":
@@ -130,6 +133,11 @@ def _make_opt(cfg: RunConfig):
         return optax.adam(sched)
     if cfg.optimizer == "adamw":
         return optax.adamw(sched, weight_decay=cfg.weight_decay)
+    if cfg.optimizer == "sgd":
+        return optax.chain(
+            optax.add_decayed_weights(cfg.weight_decay),
+            optax.sgd(sched, momentum=cfg.momentum or None),
+        )
     raise ValueError(f"unknown optimizer {cfg.optimizer!r}")
 
 
@@ -335,7 +343,8 @@ def main():
         ("eval_every", int), ("eval_n", int), ("checkpoint_every", int),
         ("out_dir", str),
         ("output_wires", lambda s: tuple(int(x) for x in s.split(","))),
-        ("optimizer", str), ("weight_decay", float), ("task", str),
+        ("optimizer", str), ("weight_decay", float), ("momentum", float),
+        ("task", str),
         ("train_frac", float), ("pool_seed", int),
         ("weight_noise", float), ("noise_mode", str),
     ]:

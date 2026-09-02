@@ -87,6 +87,19 @@ def test_weight_noise(tmp_path):
     assert not np.allclose(p["train_loss"], a["train_loss"])
 
 
+def test_sgd_option(tmp_path):
+    cfg = replace(tiny_cfg(tmp_path, optimizer="sgd", weight_decay=1e-2), lr=0.1)
+    assert "_sgdwd0.01_" in cfg.name
+    assert "m0_" in tiny_cfg(tmp_path, optimizer="sgd", momentum=0.0).name
+    _, d = load_run(run(cfg, quiet=True))
+    assert np.isfinite(d["train_loss"]).all()
+
+    # weight decay actually changes the trajectory
+    heavy = replace(tiny_cfg(tmp_path / "wd", optimizer="sgd", weight_decay=0.5), lr=0.1)
+    _, h = load_run(run(heavy, quiet=True))
+    assert not np.allclose(h["train_loss"], d["train_loss"])
+
+
 def test_adamw_option(tmp_path):
     cfg = tiny_cfg(tmp_path, optimizer="adamw", weight_decay=1e-2)
     assert "_adamwwd0.01_" in cfg.name
