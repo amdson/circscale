@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 
 from train import RunConfig, load_run, run
@@ -49,6 +51,19 @@ def test_output_wires_mask(tmp_path):
     loaded_cfg, d = load_run(path)
     assert loaded_cfg["output_wires"] == [3, 7]
     assert d["per_out_loss"].shape[1] == 32  # eval still covers every output
+
+
+def test_train_frac(tmp_path):
+    cfg = replace(tiny_cfg(tmp_path), n_wires=8, circ_depth=4, train_frac=0.5)
+    assert "_tf0.5_" in cfg.name
+    _, d = load_run(run(cfg, quiet=True))
+    assert d["train_pool"].shape == (128,)
+    assert d["per_out_loss_tr"].shape == d["per_out_loss_ho"].shape == (4, 8)
+    # full-enumeration eval is the even mix of the two halves
+    np.testing.assert_allclose(
+        d["per_out_loss"], (d["per_out_loss_tr"] + d["per_out_loss_ho"]) / 2,
+        rtol=1e-5,
+    )
 
 
 def test_adamw_option(tmp_path):

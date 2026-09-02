@@ -57,6 +57,12 @@ class RunConfig:
     # loss restriction: train only on these output wires (None = all 256).
     # Eval still records every output, so incidental learning is visible.
     output_wires: tuple | None = None
+    # low-data regime: train on a fixed random subset of the input space
+    # (requires n_wires <= 16 so it can be enumerated). Eval then runs on the
+    # full enumeration and additionally records train-pool (_tr) and held-out
+    # (_ho) per-output series. None = online training on fresh samples.
+    train_frac: float | None = None
+    pool_seed: int = 0
     # eval / io
     eval_every: int = 500
     eval_n: int = 4000
@@ -74,6 +80,10 @@ class RunConfig:
             s += f"_{self.task}"
         if (self.n_wires, self.circ_depth) != (256, 32):
             s += f"_c{self.n_wires}x{self.circ_depth}"
+        if self.train_frac is not None:
+            s += f"_tf{self.train_frac:g}"
+            if self.pool_seed != 0:
+                s += f"ps{self.pool_seed}"
         if self.output_wires is not None:
             ow = "-".join(map(str, self.output_wires))
             if len(self.output_wires) > 12:
@@ -150,6 +160,17 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     wire_mask = None if cfg.output_wires is None else jnp.asarray(cfg.output_wires)
     data_key = jax.random.key(cfg.model_seed if cfg.data_seed is None else cfg.data_seed)
 
+    if cfg.train_frac is not None:
+        if cfg.n_wires > 16:
+            raise ValueError("train_frac requires n_wires <= 16 (enumerable inputs)")
+        n_all = 2 ** cfg.n_wires
+        all_x = ((np.arange(n_all)[:, None] >> np.arange(cfg.n_wires)[::-1]) & 1
+                 ).astype(np.uint8)
+        n_pool = int(round(cfg.train_frac * n_all))
+        pool_idx = np.sort(np.random.default_rng(cfg.pool_seed)
+                           .choice(n_all, n_pool, replace=False))
+        train_x = jnp.asarray(all_x[pool_idx])
+
     if cfg.ckpt_path.exists():
         with open(cfg.ckpt_path, "rb") as f:
             st = pickle.load(f)
@@ -167,11 +188,20 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
             "per_out_acc": [],
             "wall_time": 0.0,
         }
+        if cfg.train_frac is not None:
+            for k in ("per_out_loss_tr", "per_out_acc_tr",
+                      "per_out_loss_ho", "per_out_acc_ho"):
+                st[k] = []
 
     @jax.jit
     def train_step(params, opt_state, step):
         key = jax.random.fold_in(data_key, step)
-        x = jax.random.bernoulli(key, shape=(cfg.batch, cfg.n_wires)).astype(jnp.uint8)
+        if cfg.train_frac is None:
+            x = jax.random.bernoulli(
+                key, shape=(cfg.batch, cfg.n_wires)
+            ).astype(jnp.uint8)
+        else:
+            x = train_x[jax.random.randint(key, (cfg.batch,), 0, n_pool)]
         y = circ_eval(x).astype(jnp.float32)
         def loss_fn(p):
             pol = per_output_bce(forward(p, x), y)
@@ -181,26 +211,40 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         updates, opt_state = opt.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), opt_state, loss
 
-    eval_x = jax.random.bernoulli(
-        jax.random.key(cfg.eval_seed), shape=(cfg.eval_n, cfg.n_wires)
-    ).astype(jnp.uint8)
+    if cfg.train_frac is None:
+        eval_x = jax.random.bernoulli(
+            jax.random.key(cfg.eval_seed), shape=(cfg.eval_n, cfg.n_wires)
+        ).astype(jnp.uint8)
+    else:
+        eval_x = jnp.asarray(all_x)  # full enumeration; _tr/_ho split it
+        in_pool = np.zeros(n_all, dtype=bool)
+        in_pool[pool_idx] = True
+        tr_w = jnp.asarray(in_pool, dtype=jnp.float32)
+        ho_w = jnp.asarray(~in_pool, dtype=jnp.float32)
     eval_y = circ_eval(eval_x).astype(jnp.float32)
 
     @jax.jit
     def evaluate(params):
         logits = forward(params, eval_x)
-        return (
-            per_output_bce(logits, eval_y),
-            jnp.mean((logits > 0) == (eval_y > 0.5), axis=0),
-        )
+        pel = jax.nn.softplus(logits) - logits * eval_y  # per-example BCE
+        acc = ((logits > 0) == (eval_y > 0.5)).astype(jnp.float32)
+        out = [jnp.mean(pel, axis=0), jnp.mean(acc, axis=0)]
+        if cfg.train_frac is not None:
+            for w in (tr_w, ho_w):
+                out += [(w @ pel) / w.sum(), (w @ acc) / w.sum()]
+        return out
+
+    eval_keys = ["per_out_loss", "per_out_acc"]
+    if cfg.train_frac is not None:
+        eval_keys += ["per_out_loss_tr", "per_out_acc_tr",
+                      "per_out_loss_ho", "per_out_acc_ho"]
 
     def run_eval(step):
         if st["eval_steps"] and st["eval_steps"][-1] >= step:
             return  # already evaluated at this step before checkpointing
-        pol, poa = jax.device_get(evaluate(st["params"]))
         st["eval_steps"].append(step)
-        st["per_out_loss"].append(pol)
-        st["per_out_acc"].append(poa)
+        for k, v in zip(eval_keys, jax.device_get(evaluate(st["params"]))):
+            st[k].append(v)
 
     start, t0, executed = st["step"], time.perf_counter(), 0
     pbar = tqdm(range(start, cfg.steps), initial=start, total=cfg.steps,
@@ -227,20 +271,24 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     run_eval(cfg.steps)
     st["wall_time"] += time.perf_counter() - t0
 
+    arrays = {k: np.array(st[k], dtype=np.float32) for k in eval_keys}
+    if cfg.train_frac is not None:
+        arrays["train_pool"] = pool_idx
     np.savez_compressed(
         cfg.npz_path,
         config=json.dumps(asdict(cfg)),
         train_loss=st["train_loss"],
         eval_steps=np.array(st["eval_steps"]),
-        per_out_loss=np.array(st["per_out_loss"], dtype=np.float32),
-        per_out_acc=np.array(st["per_out_acc"], dtype=np.float32),
         out_depths=np.asarray(circuit.out_depths),
         wall_time=st["wall_time"],
+        **arrays,
     )
     cfg.ckpt_path.unlink(missing_ok=True)
     if not quiet:
-        print(f"[done] {cfg.name}: eval loss {st['per_out_loss'][-1].mean():.4f}, "
-              f"acc {st['per_out_acc'][-1].mean():.4f}, {st['wall_time']/60:.1f} min")
+        # summarize over the trained wires only, so the number matches the task
+        sel = slice(None) if cfg.output_wires is None else list(cfg.output_wires)
+        print(f"[done] {cfg.name}: eval loss {st['per_out_loss'][-1][sel].mean():.4f}, "
+              f"acc {st['per_out_acc'][-1][sel].mean():.4f}, {st['wall_time']/60:.1f} min")
     return cfg.npz_path
 
 
@@ -261,6 +309,7 @@ def main():
         ("out_dir", str),
         ("output_wires", lambda s: tuple(int(x) for x in s.split(","))),
         ("optimizer", str), ("weight_decay", float), ("task", str),
+        ("train_frac", float), ("pool_seed", int),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)
