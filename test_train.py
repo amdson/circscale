@@ -66,6 +66,23 @@ def test_train_frac(tmp_path):
     )
 
 
+def test_weight_noise(tmp_path):
+    cfg = tiny_cfg(tmp_path, weight_noise=1e-3)
+    assert "_wn0.001_" in cfg.name
+
+    # noise is step-derived, so interrupt/resume stays exact
+    clean = run(tiny_cfg(tmp_path / "clean", weight_noise=1e-3), quiet=True)
+    assert run(cfg, stop_after=25, quiet=True) is None
+    resumed = run(cfg, quiet=True)
+    _, a = load_run(clean)
+    _, b = load_run(resumed)
+    np.testing.assert_allclose(a["train_loss"], b["train_loss"], rtol=1e-6)
+
+    # and it actually perturbs training relative to the noiseless run
+    _, base = load_run(run(tiny_cfg(tmp_path / "base"), quiet=True))
+    assert not np.allclose(a["train_loss"], base["train_loss"])
+
+
 def test_adamw_option(tmp_path):
     cfg = tiny_cfg(tmp_path, optimizer="adamw", weight_decay=1e-2)
     assert "_adamwwd0.01_" in cfg.name

@@ -46,6 +46,9 @@ class RunConfig:
     schedule: str = "constant"  # "constant" (honest mid-run L(N,D) points) or "cosine"
     optimizer: str = "adam"     # "adam" | "adamw"
     weight_decay: float = 0.0   # adamw only
+    # Langevin-style regularizer: after every optimizer step, add
+    # N(0, weight_noise^2) to every parameter. 0 disables.
+    weight_noise: float = 0.0
     # circuit / seeds
     task: str = "brickwork"  # "brickwork" | "tree3" (n_wires = 3^circ_depth leaves)
     n_wires: int = 256
@@ -76,6 +79,8 @@ class RunConfig:
             s += f"_{self.schedule}"
         if self.optimizer != "adam":
             s += f"_{self.optimizer}wd{self.weight_decay:g}"
+        if self.weight_noise:
+            s += f"_wn{self.weight_noise:g}"
         if self.task != "brickwork":
             s += f"_{self.task}"
         if (self.n_wires, self.circ_depth) != (256, 32):
@@ -159,6 +164,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     opt = _make_opt(cfg)
     wire_mask = None if cfg.output_wires is None else jnp.asarray(cfg.output_wires)
     data_key = jax.random.key(cfg.model_seed if cfg.data_seed is None else cfg.data_seed)
+    noise_key = jax.random.split(data_key)[0]  # stream independent of the batch keys
 
     if cfg.train_frac is not None:
         if cfg.n_wires > 16:
@@ -209,7 +215,15 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, opt_state = opt.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, loss
+        params = optax.apply_updates(params, updates)
+        if cfg.weight_noise:
+            leaves, tdef = jax.tree_util.tree_flatten(params)
+            keys = jax.random.split(jax.random.fold_in(noise_key, step), len(leaves))
+            params = jax.tree_util.tree_unflatten(tdef, [
+                p + cfg.weight_noise * jax.random.normal(k, p.shape, p.dtype)
+                for p, k in zip(leaves, keys)
+            ])
+        return params, opt_state, loss
 
     if cfg.train_frac is None:
         eval_x = jax.random.bernoulli(
@@ -309,7 +323,7 @@ def main():
         ("out_dir", str),
         ("output_wires", lambda s: tuple(int(x) for x in s.split(","))),
         ("optimizer", str), ("weight_decay", float), ("task", str),
-        ("train_frac", float), ("pool_seed", int),
+        ("train_frac", float), ("pool_seed", int), ("weight_noise", float),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)
