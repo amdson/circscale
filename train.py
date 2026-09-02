@@ -46,9 +46,14 @@ class RunConfig:
     schedule: str = "constant"  # "constant" (honest mid-run L(N,D) points) or "cosine"
     optimizer: str = "adam"     # "adam" | "adamw"
     weight_decay: float = 0.0   # adamw only
-    # Langevin-style regularizer: after every optimizer step, add
-    # N(0, weight_noise^2) to every parameter. 0 disables.
+    # Gaussian weight-noise regularizer, std weight_noise (0 disables).
+    # "transient": perturb weights for the forward/backward only, update the
+    #   clean weights — minimizes the Gaussian-smoothed loss (with adamw
+    #   weight decay this is an ELBO with a fixed-variance posterior and
+    #   Gaussian prior). "persist": add noise into the weights after each
+    #   optimizer step (Langevin-style).
     weight_noise: float = 0.0
+    noise_mode: str = "transient"  # "transient" | "persist"
     # circuit / seeds
     task: str = "brickwork"  # "brickwork" | "tree3" (n_wires = 3^circ_depth leaves)
     n_wires: int = 256
@@ -79,8 +84,8 @@ class RunConfig:
             s += f"_{self.schedule}"
         if self.optimizer != "adam":
             s += f"_{self.optimizer}wd{self.weight_decay:g}"
-        if self.weight_noise:
-            s += f"_wn{self.weight_noise:g}"
+        if self.weight_noise:  # persist mode tagged with a trailing "p"
+            s += f"_wn{self.weight_noise:g}" + ("p" if self.noise_mode == "persist" else "")
         if self.task != "brickwork":
             s += f"_{self.task}"
         if (self.n_wires, self.circ_depth) != (256, 32):
@@ -140,6 +145,8 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     early by `stop_after` (a step budget for this invocation; mainly for
     tests) — in that case a checkpoint is left behind and a later call
     resumes it."""
+    if cfg.noise_mode not in ("transient", "persist"):
+        raise ValueError(f"unknown noise_mode {cfg.noise_mode!r}")
     if cfg.npz_path.exists():
         if not quiet:
             print(f"[skip] {cfg.name} (done)")
@@ -213,16 +220,22 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
             pol = per_output_bce(forward(p, x), y)
             return jnp.mean(pol if wire_mask is None else pol[wire_mask])
 
-        loss, grads = jax.value_and_grad(loss_fn)(params)
-        updates, opt_state = opt.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        if cfg.weight_noise:
-            leaves, tdef = jax.tree_util.tree_flatten(params)
+        def add_noise(p_tree):
+            leaves, tdef = jax.tree_util.tree_flatten(p_tree)
             keys = jax.random.split(jax.random.fold_in(noise_key, step), len(leaves))
-            params = jax.tree_util.tree_unflatten(tdef, [
+            return jax.tree_util.tree_unflatten(tdef, [
                 p + cfg.weight_noise * jax.random.normal(k, p.shape, p.dtype)
                 for p, k in zip(leaves, keys)
             ])
+
+        at = add_noise(params) if cfg.weight_noise and cfg.noise_mode == "transient" \
+            else params
+        loss, grads = jax.value_and_grad(loss_fn)(at)
+        # updates (incl. adamw decay) are applied to the clean weights
+        updates, opt_state = opt.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        if cfg.weight_noise and cfg.noise_mode == "persist":
+            params = add_noise(params)
         return params, opt_state, loss
 
     if cfg.train_frac is None:
@@ -323,7 +336,8 @@ def main():
         ("out_dir", str),
         ("output_wires", lambda s: tuple(int(x) for x in s.split(","))),
         ("optimizer", str), ("weight_decay", float), ("task", str),
-        ("train_frac", float), ("pool_seed", int), ("weight_noise", float),
+        ("train_frac", float), ("pool_seed", int),
+        ("weight_noise", float), ("noise_mode", str),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)

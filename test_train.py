@@ -68,7 +68,9 @@ def test_train_frac(tmp_path):
 
 def test_weight_noise(tmp_path):
     cfg = tiny_cfg(tmp_path, weight_noise=1e-3)
-    assert "_wn0.001_" in cfg.name
+    assert "_wn0.001_" in cfg.name  # transient is the default
+    persist = tiny_cfg(tmp_path / "persist", weight_noise=1e-3, noise_mode="persist")
+    assert "_wn0.001p_" in persist.name
 
     # noise is step-derived, so interrupt/resume stays exact
     clean = run(tiny_cfg(tmp_path / "clean", weight_noise=1e-3), quiet=True)
@@ -78,9 +80,11 @@ def test_weight_noise(tmp_path):
     _, b = load_run(resumed)
     np.testing.assert_allclose(a["train_loss"], b["train_loss"], rtol=1e-6)
 
-    # and it actually perturbs training relative to the noiseless run
+    # both modes actually perturb training, and differently
     _, base = load_run(run(tiny_cfg(tmp_path / "base"), quiet=True))
+    _, p = load_run(run(persist, quiet=True))
     assert not np.allclose(a["train_loss"], base["train_loss"])
+    assert not np.allclose(p["train_loss"], a["train_loss"])
 
 
 def test_adamw_option(tmp_path):
