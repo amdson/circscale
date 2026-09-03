@@ -52,6 +52,7 @@ class RunConfig:
     optimizer: str = "adam"     # "adam" | "adamw" | "sgd"
     adam_eps: float = 1e-8      # adam/adamw; raising it (1e-4-ish) tames spikes
     weight_decay: float = 0.0   # adamw (decoupled) and sgd (classic L2-style)
+    decay_norms: bool = True    # False: decay weight matrices only (norm gains exempt)
     momentum: float = 0.9       # sgd only; 0 = vanilla SGD
     # Gaussian weight-noise regularizer (0 disables).
     # noise_mode — "transient": perturb weights for the forward/backward only,
@@ -101,6 +102,8 @@ class RunConfig:
             s += f"_{self.optimizer}wd{self.weight_decay:g}"
             if self.optimizer == "sgd" and self.momentum != 0.9:
                 s += f"m{self.momentum:g}"
+            if not self.decay_norms:
+                s += "wm"
         if self.adam_eps != 1e-8 and self.optimizer in ("adam", "adamw"):
             s += f"_eps{self.adam_eps:g}"
         if self.init_scale != 1.0:
@@ -150,15 +153,19 @@ def _make_schedule(cfg: RunConfig):
     raise ValueError(f"unknown schedule {cfg.schedule!r}")
 
 
-def _make_opt(cfg: RunConfig):
+def _make_opt(cfg: RunConfig, mlp_cfg: MLPConfig | None = None):
     sched = _make_schedule(cfg)
+    mask = None
+    if not cfg.decay_norms:  # decay only leaves with a nonzero init std
+        mask = jax.tree_util.tree_map(lambda s: s > 0, init_stds(mlp_cfg))
     if cfg.optimizer == "adam":
         return optax.adam(sched, eps=cfg.adam_eps)
     if cfg.optimizer == "adamw":
-        return optax.adamw(sched, eps=cfg.adam_eps, weight_decay=cfg.weight_decay)
+        return optax.adamw(sched, eps=cfg.adam_eps, weight_decay=cfg.weight_decay,
+                           mask=mask)
     if cfg.optimizer == "sgd":
         return optax.chain(
-            optax.add_decayed_weights(cfg.weight_decay),
+            optax.add_decayed_weights(cfg.weight_decay, mask=mask),
             optax.sgd(sched, momentum=cfg.momentum or None),
         )
     raise ValueError(f"unknown optimizer {cfg.optimizer!r}")
@@ -201,7 +208,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         n_inputs=cfg.n_wires, n_outputs=n_out,
         width=cfg.width, depth=cfg.mlp_depth, hidden_ratio=cfg.hidden_ratio,
     )
-    opt = _make_opt(cfg)
+    opt = _make_opt(cfg, mlp_cfg)
     wire_mask = None if cfg.output_wires is None else jnp.asarray(cfg.output_wires)
     data_key = jax.random.key(cfg.model_seed if cfg.data_seed is None else cfg.data_seed)
     noise_key = jax.random.split(data_key)[0]  # stream independent of the batch keys
@@ -396,6 +403,7 @@ def main():
         ("weight_noise", float), ("noise_mode", str), ("noise_scale", str),
         ("init_scale", float), ("adam_eps", float),
         ("save_params", lambda s: s.lower() in ("1", "true", "yes")),
+        ("decay_norms", lambda s: s.lower() in ("1", "true", "yes")),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)

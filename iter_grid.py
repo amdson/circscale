@@ -101,6 +101,53 @@ BATCHES: dict[str, list[dict]] = {
     "deep_eps_c": [dict(width=256, mlp_depth=6, lr=1e-3, steps=30_000, weight_noise=0.5,
                         adam_eps=1e-4, model_seed=s) for s in [0, 1]]
                   + _grid(train_frac=[0.3], weight_noise=[0.5, 1.0], adam_eps=[1e-4], model_seed=SEEDS),
+    # scale x noise strength in the low-data regime (params saved for ensembles)
+    **{f"scale_w{w}": _grid(width=[w], mlp_depth=[4], lr=[1e-3], steps=[20_000],
+                            adam_eps=[1e-4], train_frac=[0.25],
+                            weight_noise=[0.5, 1.0, 2.0, 3.0], model_seed=SEEDS,
+                            out_dir=["runs/scale"], save_params=[True])
+       for w in [64, 128, 256, 512]},
+    # round 2: making width help at train_frac 0.25
+    "scale2_a": _grid(width=[512], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                      train_frac=[0.25], weight_noise=[0.2, 0.3], model_seed=[0, 1],
+                      out_dir=["runs/scale"], save_params=[True])
+                + _grid(width=[512], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                        train_frac=[0.25], weight_noise=[0.5, 1.0], noise_scale=["rms"],
+                        model_seed=[0, 1], out_dir=["runs/scale"], save_params=[True]),
+    "scale2_b": _grid(width=[512], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                      train_frac=[0.25], weight_noise=[0.5], init_scale=[0.5], model_seed=[0, 1],
+                      out_dir=["runs/scale"], save_params=[True])
+                + _grid(width=[512], mlp_depth=[4], lr=[3e-4], steps=[20_000], adam_eps=[1e-4],
+                        train_frac=[0.25], weight_noise=[0.5], model_seed=[0, 1],
+                        out_dir=["runs/scale"], save_params=[True]),
+    "scale2_c": _grid(width=[64], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                      train_frac=[0.25], weight_noise=[1.0, 2.0], noise_scale=["rms"],
+                      model_seed=SEEDS, out_dir=["runs/scale"], save_params=[True])
+                + _grid(width=[256], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                        train_frac=[0.25], weight_noise=[0.2, 0.3], model_seed=SEEDS,
+                        out_dir=["runs/scale"], save_params=[True]),
+    "scale2_d": _grid(width=[128], mlp_depth=[8], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                      train_frac=[0.25], weight_noise=[0.5, 1.0], model_seed=SEEDS,
+                      out_dir=["runs/scale"], save_params=[True])
+                + _grid(width=[64], mlp_depth=[8], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                        train_frac=[0.25], weight_noise=[1.0], model_seed=SEEDS,
+                        out_dir=["runs/scale"], save_params=[True]),
+    "scale2_e": _grid(width=[512, 256], mlp_depth=[4], lr=[3e-3], steps=[20_000], adam_eps=[1e-4],
+                      train_frac=[0.25], weight_noise=[1.0], model_seed=[0, 1],
+                      out_dir=["runs/scale"], save_params=[True])
+                + _grid(width=[512], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                        train_frac=[0.25], weight_noise=[0.5], init_scale=[0.2], model_seed=[0, 1],
+                        out_dir=["runs/scale"], save_params=[True]),
+    # weight decay x noise (ELBO pairing) across width, train_frac 0.25
+    **{f"wd_w{w}_{wd:g}": _grid(width=[w], mlp_depth=[4], lr=[1e-3], steps=[20_000],
+                                adam_eps=[1e-4], train_frac=[0.25], optimizer=["adamw"],
+                                decay_norms=[False], weight_decay=[wd], weight_noise=[0.5, 1.0],
+                                model_seed=[0, 1], out_dir=["runs/scale"], save_params=[True])
+       for w in [128, 512] for wd in [0.1, 0.3, 1.0]},
+    "wd_w64": _grid(width=[64], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                    train_frac=[0.25], optimizer=["adamw"], decay_norms=[False],
+                    weight_decay=[0.3, 1.0], weight_noise=[1.0],
+                    model_seed=[0, 1], out_dir=["runs/scale"], save_params=[True]),
     "deep_seeds": [dict(width=512, mlp_depth=8, lr=1e-3, weight_noise=wn, model_seed=s)
                    for wn in [0.0, 0.5] for s in [1, 2]],
 }
