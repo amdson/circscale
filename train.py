@@ -38,6 +38,11 @@ class RunConfig:
     width: int = 256
     mlp_depth: int = 4
     hidden_ratio: int = 4
+    # multiply all weight-matrix inits by this (norm scales stay at 1).
+    # Small values (<1) are the Omnigrok lever: init norm controls the
+    # memorize->generalize delay. Init-relative weight_noise stays anchored
+    # to the nominal (unscaled) init stds.
+    init_scale: float = 1.0
     # training
     batch: int = 256
     steps: int = 50_000
@@ -45,6 +50,7 @@ class RunConfig:
     warmup: int = 500
     schedule: str = "constant"  # "constant" (honest mid-run L(N,D) points) or "cosine"
     optimizer: str = "adam"     # "adam" | "adamw" | "sgd"
+    adam_eps: float = 1e-8      # adam/adamw; raising it (1e-4-ish) tames spikes
     weight_decay: float = 0.0   # adamw (decoupled) and sgd (classic L2-style)
     momentum: float = 0.9       # sgd only; 0 = vanilla SGD
     # Gaussian weight-noise regularizer (0 disables).
@@ -92,6 +98,10 @@ class RunConfig:
             s += f"_{self.optimizer}wd{self.weight_decay:g}"
             if self.optimizer == "sgd" and self.momentum != 0.9:
                 s += f"m{self.momentum:g}"
+        if self.adam_eps != 1e-8 and self.optimizer in ("adam", "adamw"):
+            s += f"_eps{self.adam_eps:g}"
+        if self.init_scale != 1.0:
+            s += f"_is{self.init_scale:g}"
         if self.weight_noise:  # "wnr" = init-relative, "wn" = absolute; "p" = persist
             tag = "wnr" if self.noise_scale == "init" else "wn"
             s += f"_{tag}{self.weight_noise:g}" + ("p" if self.noise_mode == "persist" else "")
@@ -136,9 +146,9 @@ def _make_schedule(cfg: RunConfig):
 def _make_opt(cfg: RunConfig):
     sched = _make_schedule(cfg)
     if cfg.optimizer == "adam":
-        return optax.adam(sched)
+        return optax.adam(sched, eps=cfg.adam_eps)
     if cfg.optimizer == "adamw":
-        return optax.adamw(sched, weight_decay=cfg.weight_decay)
+        return optax.adamw(sched, eps=cfg.adam_eps, weight_decay=cfg.weight_decay)
     if cfg.optimizer == "sgd":
         return optax.chain(
             optax.add_decayed_weights(cfg.weight_decay),
@@ -211,8 +221,13 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
             print(f"[resume] {cfg.name} at step {st['step']}")
     else:
         params = init_params(jax.random.key(cfg.model_seed), mlp_cfg)
+        if cfg.init_scale != 1.0:  # scale weight matrices only (std > 0)
+            params = jax.tree_util.tree_map(
+                lambda p, s: p * cfg.init_scale if s else p,
+                params, init_stds(mlp_cfg))
         st = {
             "step": 0,
+            "param_norm": [],
             "params": params,
             "opt_state": opt.init(params),
             "train_loss": np.zeros(cfg.steps, dtype=np.float32),
@@ -292,6 +307,10 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         st["eval_steps"].append(step)
         for k, v in zip(eval_keys, jax.device_get(evaluate(st["params"]))):
             st[k].append(v)
+        if "param_norm" in st:  # absent when resuming pre-param_norm checkpoints
+            st["param_norm"].append(float(np.sqrt(sum(
+                float(jnp.vdot(p, p))
+                for p in jax.tree_util.tree_leaves(st["params"])))))
 
     start, t0, executed = st["step"], time.perf_counter(), 0
     pbar = tqdm(range(start, cfg.steps), initial=start, total=cfg.steps,
@@ -321,6 +340,8 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     arrays = {k: np.array(st[k], dtype=np.float32) for k in eval_keys}
     if cfg.train_frac is not None:
         arrays["train_pool"] = pool_idx
+    if st.get("param_norm"):
+        arrays["param_norm"] = np.array(st["param_norm"], dtype=np.float32)
     np.savez_compressed(
         cfg.npz_path,
         config=json.dumps(asdict(cfg)),
@@ -359,6 +380,7 @@ def main():
         ("task", str),
         ("train_frac", float), ("pool_seed", int),
         ("weight_noise", float), ("noise_mode", str), ("noise_scale", str),
+        ("init_scale", float), ("adam_eps", float),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)

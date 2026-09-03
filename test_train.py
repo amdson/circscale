@@ -21,6 +21,7 @@ def test_run_outputs(tmp_path):
     assert d["train_loss"].shape == (60,) and (d["train_loss"] > 0).all()
     assert list(d["eval_steps"]) == [0, 20, 40, 60]
     assert d["per_out_loss"].shape == (4, 32)
+    assert d["param_norm"].shape == (4,) and (d["param_norm"] > 0).all()
     assert not cfg.ckpt_path.exists()
 
     # idempotent: a second call skips without touching the file
@@ -94,6 +95,16 @@ def test_weight_noise(tmp_path):
     _, p = load_run(run(persist, quiet=True))
     assert not np.allclose(a["train_loss"], base["train_loss"])
     assert not np.allclose(p["train_loss"], a["train_loss"])
+
+
+def test_init_scale_and_adam_eps(tmp_path):
+    cfg = tiny_cfg(tmp_path, init_scale=0.3, adam_eps=1e-4)
+    assert "_eps0.0001_" in cfg.name and "_is0.3_" in cfg.name
+    _, d = load_run(run(cfg, quiet=True))
+    _, base = load_run(run(tiny_cfg(tmp_path / "base"), quiet=True))
+    # scaled init starts at a smaller norm and trains differently
+    assert d["param_norm"][0] < 0.5 * base["param_norm"][0]
+    assert not np.allclose(d["train_loss"], base["train_loss"])
 
 
 def test_sgd_option(tmp_path):
