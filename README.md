@@ -130,6 +130,47 @@ into Google Drive so progress survives runtime death, then runs `lr-tune` ->
 `main` -> quick-look plots. Every stage resumes, so disconnects only cost up
 to `checkpoint_every` steps.
 
+## Tiny circuit (`tiny_circuit.ipynb`)
+
+A minimal 8-wire, depth-4 circuit (seed 2, solo wire 0) for fast iteration:
+an online 7-shape model-size sweep, plus a low-data regime
+(`RunConfig.train_frac`) that trains on a fixed random half of the 256
+inputs and evaluates train-pool vs held-out separately (`per_out_loss_tr` /
+`per_out_loss_ho` in the npz).
+
+## SGD regularizer grid (`sgd_grid.py` + `sgd_grid.ipynb`)
+
+The low-data tiny-circuit task trained with SGD+momentum over all
+combinations of `weight_decay` x `weight_noise` (init-relative, transient
+mode) across 7 model shapes, with a per-shape LR-tune stage. The config
+lives in `sgd_grid.py`; the notebook is a thin interactive wrapper. Headless:
+
+```bash
+uv run python sgd_grid.py all      # tune -> grid -> figs (figs/*.png)
+uv run python sgd_grid.py status
+```
+
+## GPU VM quickstart (Lambda etc.)
+
+```bash
+ssh ubuntu@<vm-ip>
+git clone https://github.com/amdson/circscale.git && cd circscale
+bash scripts/vm_setup.sh           # uv + CUDA jax + tests + GPU check
+tmux new -s grid
+uv run python sgd_grid.py all      # detach with ctrl-b d; resumable
+```
+
+Pull results back from your machine (merges by unique run names):
+
+```bash
+rsync -avz ubuntu@<vm-ip>:circscale/runs/ runs/
+rsync -avz ubuntu@<vm-ip>:circscale/figs/ figs/
+```
+
+Everything is idempotent — re-running any stage skips completed runs and
+resumes checkpointed ones, so spot interruptions cost at most
+`checkpoint_every` steps.
+
 ## Notes
 
 - With a random single input-bit flip, shallow-tapped outputs flip with
