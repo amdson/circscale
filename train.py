@@ -88,6 +88,7 @@ class RunConfig:
     eval_n: int = 4000
     checkpoint_every: int = 2500
     out_dir: str = "runs"
+    save_params: bool = False  # also write <name>.params.pkl at the end (not in name)
 
     @property
     def name(self) -> str:
@@ -127,6 +128,10 @@ class RunConfig:
     @property
     def ckpt_path(self) -> Path:
         return Path(self.out_dir) / f"{self.name}.ckpt.pkl"
+
+    @property
+    def params_path(self) -> Path:
+        return Path(self.out_dir) / f"{self.name}.params.pkl"
 
 
 def _make_schedule(cfg: RunConfig):
@@ -351,6 +356,9 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         wall_time=st["wall_time"],
         **arrays,
     )
+    if cfg.save_params:
+        with open(cfg.params_path, "wb") as f:
+            pickle.dump(jax.device_get(st["params"]), f)
     cfg.ckpt_path.unlink(missing_ok=True)
     if not quiet:
         # summarize over the trained wires only, so the number matches the task
@@ -381,6 +389,7 @@ def main():
         ("train_frac", float), ("pool_seed", int),
         ("weight_noise", float), ("noise_mode", str), ("noise_scale", str),
         ("init_scale", float), ("adam_eps", float),
+        ("save_params", lambda s: s.lower() in ("1", "true", "yes")),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)

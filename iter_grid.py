@@ -62,6 +62,23 @@ BATCHES: dict[str, list[dict]] = {
     "adamw3": _grid(optimizer=["adamw"], weight_decay=[1e-2, 1e-1, 3e-1, 1.0],
                     model_seed=SEEDS),
     "eps3": _grid(adam_eps=[1e-4], model_seed=SEEDS),
+    # --- scalability of the noise recipe ---
+    "lowdata": _grid(train_frac=[0.4, 0.3, 0.25, 0.2], weight_noise=[0.0, 0.5, 1.0],
+                     model_seed=SEEDS),
+    "noise_x_init": _grid(weight_noise=[0.5], init_scale=[0.2, 0.5], model_seed=SEEDS),
+    "sgdnoise": _grid(optimizer=["sgd"], lr=[0.1, 0.3], weight_noise=[0.0, 0.5, 1.0]),
+    "circuits": _grid(circuit_seed=[0, 1, 3, 4], weight_noise=[0.0, 0.5]),
+    "allwires": _grid(output_wires=[None], weight_noise=[0.0, 0.5], model_seed=SEEDS),
+    "shapes_a": [dict(width=w, mlp_depth=d, lr=3e-3, weight_noise=wn)
+                 for w, d in [(32, 2), (64, 3), (180, 5), (256, 6), (360, 7), (512, 8)]
+                 for wn in [0.0, 0.5]],
+    "shapes_b": [dict(width=w, mlp_depth=d, lr=1e-3, weight_noise=wn)
+                 for w, d in [(32, 2), (64, 3), (180, 5), (256, 6), (360, 7), (512, 8)]
+                 for wn in [0.0, 0.5]],
+    # recipe robustness: lr sensitivity, other train pools, long horizon
+    "lr": _grid(lr=[1e-3, 1e-2], weight_noise=[0.0, 0.5], model_seed=SEEDS),
+    "pools": _grid(pool_seed=[1, 2], weight_noise=[0.0, 0.5], model_seed=SEEDS),
+    "long": _grid(steps=[50_000], weight_noise=[0.3, 0.5, 1.0], model_seed=[0, 1]),
 }
 
 
@@ -71,30 +88,31 @@ def batch_cfgs(name: str) -> list[RunConfig]:
 
 # ---------------------------------------------------------------- metrics ---
 
-def spike_count(train_loss: np.ndarray, factor: float = 10.0, win: int = 200,
-                floor: float = 0.02) -> int:
-    """Number of distinct spike events: per-step train loss jumps above
-    `factor` x its trailing-window minimum (and above `floor`), counted once
-    per contiguous excursion."""
-    tl = np.asarray(train_loss, dtype=np.float64)
-    n, events, inside = len(tl), 0, False
-    for t in range(win, n):
-        base = tl[t - win:t].min()
-        hi = tl[t] > max(factor * base, floor)
+def spike_count(tr_bce: np.ndarray, factor: float = 10.0, floor: float = 0.02) -> int:
+    """Distinct spike events in the (clean) train-pool BCE eval series: a
+    checkpoint whose loss exceeds `factor` x the running minimum so far and
+    `floor`, counted once per contiguous excursion."""
+    tl = np.asarray(tr_bce, dtype=np.float64)
+    events, inside, run_min = 0, False, np.inf
+    for v in tl:
+        hi = v > max(factor * run_min, floor)
         if hi and not inside:
             events += 1
         inside = hi
+        run_min = min(run_min, v)
     return events
 
 
 def summarize(path) -> dict:
     c, r = load_run(path)
     steps = r["eval_steps"]
-    tr_l = r["per_out_loss_tr"][:, TARGET_WIRE]
-    ho_l = r["per_out_loss_ho"][:, TARGET_WIRE]
-    tr_a = r["per_out_acc_tr"][:, TARGET_WIRE]
-    ho_a = r["per_out_acc_ho"][:, TARGET_WIRE]
+    sel = slice(None) if c["output_wires"] is None else list(c["output_wires"])
+    tr_l = r["per_out_loss_tr"][:, sel].mean(1)
+    ho_l = r["per_out_loss_ho"][:, sel].mean(1)
+    tr_a = r["per_out_acc_tr"][:, sel].mean(1)
+    ho_a = r["per_out_acc_ho"][:, sel].mean(1)
     cross = np.flatnonzero(ho_a >= 0.9)
+    solved = np.flatnonzero(ho_a >= 0.999)
     pn = r.get("param_norm")
     best = int(np.argmax(ho_a))
     return dict(
@@ -104,16 +122,17 @@ def summarize(path) -> dict:
         ho_best=float(ho_a[best]), ho_best_step=int(steps[best]),
         ho_min_bce=float(ho_l.min()),
         cross90=int(steps[cross[0]]) if len(cross) else -1,
+        solve=int(steps[solved[0]]) if len(solved) else -1,
         pn0=float(pn[0]) if pn is not None else np.nan,
         pn1=float(pn[-1]) if pn is not None else np.nan,
-        spikes=spike_count(r["train_loss"]),
+        spikes=spike_count(tr_l),
         minutes=float(r["wall_time"]) / 60,
     )
 
 
 COLS = [("name", "<62s"), ("tr_bce", ">8.4f"), ("ho_bce", ">8.4f"),
         ("tr_acc", ">7.3f"), ("ho_acc", ">7.3f"), ("ho_best", ">8.3f"),
-        ("ho_best_step", ">8d"), ("cross90", ">8d"), ("pn0", ">7.2f"),
+        ("ho_best_step", ">8d"), ("cross90", ">8d"), ("solve", ">7d"), ("pn0", ">7.2f"),
         ("pn1", ">7.2f"), ("spikes", ">7d"), ("minutes", ">5.1f")]
 
 
@@ -147,16 +166,18 @@ def stage_agg(sub: str = "") -> None:
             continue
         groups.setdefault(re.sub(r"_ms\d+$", "", p.stem), []).append(summarize(p))
     print(f"{'config':<58s}{'n':>3s}{'ho_acc':>8s}{'min':>7s}{'max':>7s}"
-          f"{'ho_bce':>8s}{'n_perf':>7s}{'cross90':>8s}{'pn0':>7s}{'pn1':>7s}{'spk':>5s}")
+          f"{'ho_bce':>8s}{'n_perf':>7s}{'cross90':>8s}{'solve':>7s}{'pn0':>7s}{'pn1':>7s}{'spk':>5s}")
     for k, rows in groups.items():
         acc = np.array([r["ho_acc"] for r in rows])
         bce = np.array([r["ho_bce"] for r in rows])
         cr = [r["cross90"] for r in rows]
         cr = [c for c in cr if c >= 0]
+        sv = [r["solve"] for r in rows if r["solve"] >= 0]
         print(f"{k.replace('w128_d4_b256_lr0.003_s10000', 'base').replace('_c8x4_tf0.5_ow0_cs2', ''):<58s}"
               f"{len(rows):>3d}{acc.mean():>8.3f}{acc.min():>7.3f}{acc.max():>7.3f}"
               f"{bce.mean():>8.3f}{int((acc >= 0.999).sum()):>7d}"
               f"{(int(np.median(cr)) if cr else -1):>8d}"
+              f"{(int(np.median(sv)) if sv else -1):>7d}"
               f"{np.mean([r['pn0'] for r in rows]):>7.2f}"
               f"{np.mean([r['pn1'] for r in rows]):>7.2f}"
               f"{int(np.mean([r['spikes'] for r in rows])):>5d}")
