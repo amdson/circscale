@@ -6,3 +6,4 @@ runs/
 history_*.npz
 figs/
 *.zip
+logs/
