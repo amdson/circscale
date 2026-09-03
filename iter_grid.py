@@ -203,6 +203,19 @@ BATCHES: dict[str, list[dict]] = {
                        train_frac=[0.25], optimizer=["adamw"], wd_scale=["init"],
                        weight_decay=[0.1], weight_noise=[0.5], model_seed=[0, 1],
                        out_dir=["runs/scale"], save_params=[True]),
+    # confirm the width recipe: noise 1.0, init-scaled wd 0.3, lr ~ 1/width
+    "wrec_w512": _grid(width=[512], mlp_depth=[4], lr=[3e-4], steps=[40_000], adam_eps=[1e-4],
+                       train_frac=[0.25], optimizer=["adamw"], wd_scale=["init"],
+                       weight_decay=[0.3], weight_noise=[1.0], model_seed=[0, 1],
+                       out_dir=["runs/scale"], save_params=[True])
+                + _grid(width=[512], mlp_depth=[4], lr=[3e-4], steps=[20_000], adam_eps=[1e-4],
+                        train_frac=[0.25], optimizer=["adamw"], wd_scale=["init"],
+                        weight_decay=[0.3], weight_noise=[1.0], model_seed=[2],
+                        out_dir=["runs/scale"], save_params=[True]),
+    "wrec_w256": _grid(width=[256], mlp_depth=[4], lr=[5e-4], steps=[20_000], adam_eps=[1e-4],
+                       train_frac=[0.25], optimizer=["adamw"], wd_scale=["init"],
+                       weight_decay=[0.3], weight_noise=[1.0], model_seed=[0, 1, 2],
+                       out_dir=["runs/scale"], save_params=[True]),
     "deep_seeds": [dict(width=512, mlp_depth=8, lr=1e-3, weight_noise=wn, model_seed=s)
                    for wn in [0.0, 0.5] for s in [1, 2]],
 }

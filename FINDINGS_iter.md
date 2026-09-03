@@ -119,7 +119,46 @@ each). All 8 wires jointly (output_wires=None): clean 0.953, noise 0.5
   train_frac 0.3, eps 1e-4 + noise 1.0 gives 1.000 / 1.000 / 0.994 and
   noise 0.5 gives 0.994 / 0.989 / 1.000 (10k steps).
 
-## Recipe
+## Does scale help in the low-data regime? (runs/scale, train_frac 0.25)
+
+Setting: 64 revealed inputs, 20k steps, adam_eps 1e-4, 2-3 seeds; "tail" =
+held-out acc averaged over the last 10% of evals. Tables:
+`uv run python scale_analysis.py` (also scores the seed ensembles).
+
+**Without decay, width hurts monotonically** (noise 0.5 / 1.0):
+w64 0.99 / 0.995, w128 0.97 / 0.998, w256 0.89 / 0.95, w512 0.86 / 0.83.
+Depth does not (w128d8 = w128d4). Noise >= 2 is bad at every width
+(0.65-0.80) and the probe shows why: those solutions are *perfectly* flat
+out to sigma 1.5 but wrong. Per-layer movement from init shrinks with width
+(w1: 0.50 -> 0.38 -> 0.32 -> 0.26 relative for w64..w512): wide nets fit the
+64 points lazily through their richer random features with tiny per-weight
+changes, which init-relative noise cannot disrupt. Smaller lr makes it
+worse (w512 lr 3e-4: movement 0.035, acc 0.85); lr 3e-3, init_scale 0.2 /
+0.5, rms-relative noise, and noise 0.2-0.3 do not fix it (0.73-0.89).
+
+**Weight decay is what restores width** (the user's suggestion): decay
+erodes the unused init features that the lazy fit relies on, and the
+shrinking norm raises the effective (init-anchored) noise. Constant AdamW
+wd 0.3 + noise 1.0 (matrices only): w512 0.95 tail, 3-seed vote 0.97; the
+runs anneal through the good regime (norm 141 -> 55, held-out still rising
+at 20k, train loss increasingly noisy as the effective noise grows).
+Init-variance-scaled decay (`wd_scale="init"`: per-leaf rate
+wd*(std_w1/std_leaf)^2, a Gaussian prior at init variance) is the best
+recipe at w128 (wd 0.1 + noise 0.5: 2/2 perfect, solve 2400) but at w512
+it oscillates: w1's norm swings 0.05-0.5x init because Adam's fixed
+per-coordinate step is 2x larger relative to w1's init at w512.
+
+**Width recipe (confirmed on 3 seeds):** noise 1.0 (init-relative), AdamW
+with init-scaled decay 0.3, lr ~ 1/width (1e-3 at w128, 5e-4 at w256,
+3e-4 at w512), adam_eps 1e-4. Tail acc: w128 0.99-1.0, w256 0.975-0.994,
+w512 0.965-0.991 (every seed touches 1.0; 40k steps: 0.965 / 0.991). The
+norm equilibrates at ~0.43x init. So with decay, width is neutral; it is
+not yet a *gain* over w64-w128, and the wide runs still fluctuate
+(w1-norm oscillation). Untried: mu-P-style per-layer lr, noise that
+scales with current leaf RMS *combined* with this decay, and multiple
+noise draws per step to damp the oscillation.
+
+## Recipe (w128, train_frac >= 0.3)
 
 Plain Adam, **lr 1e-3, adam_eps 1e-4, transient init-relative weight
 noise 0.5** (1.0 when data is scarcer), no weight decay, no schedule. On this
