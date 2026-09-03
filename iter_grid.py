@@ -1,0 +1,223 @@
+"""Headless driver for the iterative generalization experiments on the tiny
+circuit (see EXPERIMENT_BRIEF.md). Everything lands in runs/iter and is
+idempotent (train.run skips done runs and resumes checkpoints).
+
+  uv run python iter_grid.py run <batch> [<batch> ...]   # train + summarize
+  uv run python iter_grid.py summary [substring]         # table over runs/iter
+  uv run python iter_grid.py agg [substring]             # seed-aggregated table
+  uv run python iter_grid.py fig <batch> [<batch> ...]   # figs/iter_<batch>.png
+  uv run python iter_grid.py list                        # batches and their runs
+
+Batches are named lists of RunConfig overrides on top of BASE (w128d4, Adam
+lr 3e-3, 10k steps, the fixed low-data tiny-circuit task).
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+
+from train import RunConfig, load_run, run
+
+TARGET_WIRE = 0
+CHANCE = float(np.log(2))
+OUT_DIR = "runs/iter"
+FIG_DIR = "figs"
+
+BASE = dict(
+    width=128, mlp_depth=4, lr=3e-3, steps=10_000,
+    n_wires=8, circ_depth=4, circuit_seed=2, output_wires=(TARGET_WIRE,),
+    train_frac=0.5, eval_every=100, checkpoint_every=2500, out_dir=OUT_DIR,
+)
+
+
+def cfg(**kw) -> RunConfig:
+    return RunConfig(**{**BASE, **kw})
+
+
+def _grid(**axes):
+    """Cartesian product of keyword lists -> list of override dicts."""
+    out = [{}]
+    for k, vals in axes.items():
+        out = [{**o, k: v} for o in out for v in vals]
+    return out
+
+
+SEEDS = [0, 1, 2]
+
+BATCHES: dict[str, list[dict]] = {
+    # 1. diagnose (seed 0): clean Adam vs init-relative noise
+    "diag": [dict(), dict(weight_noise=0.1), dict(weight_noise=0.3)],
+    # 2. Omnigrok lever (seed 0): init scale, plain Adam
+    "init": _grid(init_scale=[0.2, 0.3, 0.5, 2.0]),
+    # --- seed-replicated batches ---
+    "base3": _grid(model_seed=SEEDS),
+    "noise3": _grid(weight_noise=[0.15, 0.2, 0.3, 0.5, 0.7, 1.0], model_seed=SEEDS),
+    "persist3": _grid(weight_noise=[0.1, 0.3], noise_mode=["persist"], model_seed=SEEDS),
+    "absnoise": _grid(weight_noise=[0.01, 0.03], noise_scale=["abs"]),
+    "init3": _grid(init_scale=[0.05, 0.1, 0.2], model_seed=SEEDS),
+    "adamw3": _grid(optimizer=["adamw"], weight_decay=[1e-2, 1e-1, 3e-1, 1.0],
+                    model_seed=SEEDS),
+    "eps3": _grid(adam_eps=[1e-4], model_seed=SEEDS),
+}
+
+
+def batch_cfgs(name: str) -> list[RunConfig]:
+    return [cfg(**o) for o in BATCHES[name]]
+
+
+# ---------------------------------------------------------------- metrics ---
+
+def spike_count(train_loss: np.ndarray, factor: float = 10.0, win: int = 200,
+                floor: float = 0.02) -> int:
+    """Number of distinct spike events: per-step train loss jumps above
+    `factor` x its trailing-window minimum (and above `floor`), counted once
+    per contiguous excursion."""
+    tl = np.asarray(train_loss, dtype=np.float64)
+    n, events, inside = len(tl), 0, False
+    for t in range(win, n):
+        base = tl[t - win:t].min()
+        hi = tl[t] > max(factor * base, floor)
+        if hi and not inside:
+            events += 1
+        inside = hi
+    return events
+
+
+def summarize(path) -> dict:
+    c, r = load_run(path)
+    steps = r["eval_steps"]
+    tr_l = r["per_out_loss_tr"][:, TARGET_WIRE]
+    ho_l = r["per_out_loss_ho"][:, TARGET_WIRE]
+    tr_a = r["per_out_acc_tr"][:, TARGET_WIRE]
+    ho_a = r["per_out_acc_ho"][:, TARGET_WIRE]
+    cross = np.flatnonzero(ho_a >= 0.9)
+    pn = r.get("param_norm")
+    best = int(np.argmax(ho_a))
+    return dict(
+        name=Path(path).stem,
+        tr_bce=float(tr_l[-1]), ho_bce=float(ho_l[-1]),
+        tr_acc=float(tr_a[-1]), ho_acc=float(ho_a[-1]),
+        ho_best=float(ho_a[best]), ho_best_step=int(steps[best]),
+        ho_min_bce=float(ho_l.min()),
+        cross90=int(steps[cross[0]]) if len(cross) else -1,
+        pn0=float(pn[0]) if pn is not None else np.nan,
+        pn1=float(pn[-1]) if pn is not None else np.nan,
+        spikes=spike_count(r["train_loss"]),
+        minutes=float(r["wall_time"]) / 60,
+    )
+
+
+COLS = [("name", "<62s"), ("tr_bce", ">8.4f"), ("ho_bce", ">8.4f"),
+        ("tr_acc", ">7.3f"), ("ho_acc", ">7.3f"), ("ho_best", ">8.3f"),
+        ("ho_best_step", ">8d"), ("cross90", ">8d"), ("pn0", ">7.2f"),
+        ("pn1", ">7.2f"), ("spikes", ">7d"), ("minutes", ">5.1f")]
+
+
+def print_table(rows: list[dict]) -> None:
+    print("".join(f"{k:{f[0]}{re.match(r'[<>](\d+)', f).group(1)}s}" for k, f in COLS))
+    for row in rows:
+        print("".join(f"{row[k]:{f}}" for k, f in COLS))
+
+
+def stage_run(names: list[str]) -> None:
+    for name in names:
+        rows = []
+        for c in batch_cfgs(name):
+            run(c, quiet=True)
+            rows.append(summarize(c.npz_path))
+            print(f"[{name}] done {c.name}", flush=True)
+        print(f"\n== batch {name} ==")
+        print_table(rows)
+
+
+def stage_summary(sub: str = "") -> None:
+    paths = sorted(p for p in Path(OUT_DIR).glob("*.npz") if sub in p.name)
+    print_table([summarize(p) for p in paths])
+
+
+def stage_agg(sub: str = "") -> None:
+    """Seed-aggregated table: group runs by name with the _msN tag removed."""
+    groups: dict[str, list[dict]] = {}
+    for p in sorted(Path(OUT_DIR).glob("*.npz")):
+        if sub not in p.name:
+            continue
+        groups.setdefault(re.sub(r"_ms\d+$", "", p.stem), []).append(summarize(p))
+    print(f"{'config':<58s}{'n':>3s}{'ho_acc':>8s}{'min':>7s}{'max':>7s}"
+          f"{'ho_bce':>8s}{'n_perf':>7s}{'cross90':>8s}{'pn0':>7s}{'pn1':>7s}{'spk':>5s}")
+    for k, rows in groups.items():
+        acc = np.array([r["ho_acc"] for r in rows])
+        bce = np.array([r["ho_bce"] for r in rows])
+        cr = [r["cross90"] for r in rows]
+        cr = [c for c in cr if c >= 0]
+        print(f"{k.replace('w128_d4_b256_lr0.003_s10000', 'base').replace('_c8x4_tf0.5_ow0_cs2', ''):<58s}"
+              f"{len(rows):>3d}{acc.mean():>8.3f}{acc.min():>7.3f}{acc.max():>7.3f}"
+              f"{bce.mean():>8.3f}{int((acc >= 0.999).sum()):>7d}"
+              f"{(int(np.median(cr)) if cr else -1):>8d}"
+              f"{np.mean([r['pn0'] for r in rows]):>7.2f}"
+              f"{np.mean([r['pn1'] for r in rows]):>7.2f}"
+              f"{int(np.mean([r['spikes'] for r in rows])):>5d}")
+
+
+def stage_fig(names: list[str]) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    for name in names:
+        cs = [c for c in batch_cfgs(name) if c.npz_path.exists()]
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+        for i, c in enumerate(cs):
+            _, r = load_run(c.npz_path)
+            m = r["eval_steps"] > 0
+            s = r["eval_steps"][m]
+            col = f"C{i}"
+            lab = c.name.replace("w128_d4_b256_lr0.003_s10000", "base") \
+                        .replace("_c8x4_tf0.5_ow0_cs2_ms0", "")
+            axes[0].plot(s, np.maximum(r["per_out_loss_tr"][m][:, TARGET_WIRE], 1e-6),
+                         "--", color=col, lw=0.8)
+            axes[0].plot(s, np.maximum(r["per_out_loss_ho"][m][:, TARGET_WIRE], 1e-6),
+                         "-", color=col, lw=1.0, label=lab)
+            axes[1].plot(s, r["per_out_acc_ho"][m][:, TARGET_WIRE], color=col, lw=1.0)
+            if "param_norm" in r:
+                axes[2].plot(s, r["param_norm"][m], color=col, lw=1.0)
+        axes[0].axhline(CHANCE, color="gray", ls=":", lw=0.6)
+        axes[0].set(xscale="log", yscale="log", xlabel="step",
+                    ylabel="BCE (dashed=train, solid=held-out)")
+        axes[1].set(xscale="log", xlabel="step", ylabel="held-out acc", ylim=(0.4, 1.02))
+        axes[2].set(xscale="log", xlabel="step", ylabel="param norm")
+        axes[0].legend(fontsize=6)
+        fig.suptitle(f"batch {name}")
+        fig.tight_layout()
+        Path(FIG_DIR).mkdir(exist_ok=True)
+        out = f"{FIG_DIR}/iter_{name}.png"
+        fig.savefig(out, dpi=130, bbox_inches="tight")
+        print(f"wrote {out}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    stage, args = sys.argv[1], sys.argv[2:]
+    if stage == "run":
+        stage_run(args)
+    elif stage == "summary":
+        stage_summary(args[0] if args else "")
+    elif stage == "agg":
+        stage_agg(args[0] if args else "")
+    elif stage == "fig":
+        stage_fig(args)
+    elif stage == "list":
+        for k in BATCHES:
+            print(k)
+            for c in batch_cfgs(k):
+                print("   ", c.name, "(done)" if c.npz_path.exists() else "")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()
