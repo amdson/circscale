@@ -89,6 +89,21 @@ def test_epoch_order(tmp_path):
     assert np.isfinite(d["train_loss"]).all()
 
 
+def test_train_n(tmp_path):
+    cfg = tiny_cfg(tmp_path, train_n=128)  # n_wires=32: not enumerable
+    assert "_tn128_" in cfg.name
+    _, d = load_run(run(cfg, quiet=True))
+    assert d["per_out_loss_tr"].shape == d["per_out_loss_ho"].shape == (4, 32)
+    # headline series is the held-out set
+    np.testing.assert_allclose(d["per_out_loss"], d["per_out_loss_ho"], rtol=1e-6)
+    # pool is memorizable: train loss should sit below held-out by the end
+    assert d["per_out_loss_tr"][-1].mean() < d["per_out_loss_ho"][-1].mean()
+
+    epoch = tiny_cfg(tmp_path / "ep", train_n=128, data_order="epoch")
+    assert "_tn128_epoch_" in epoch.name
+    run(epoch, quiet=True)
+
+
 def test_weight_noise(tmp_path):
     cfg = tiny_cfg(tmp_path, weight_noise=0.1)
     assert "_wnr0.1_" in cfg.name  # transient + init-relative are the defaults

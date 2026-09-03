@@ -91,6 +91,12 @@ class RunConfig:
     # (_ho) per-output series. None = online training on fresh samples.
     train_frac: float | None = None
     pool_seed: int = 0
+    # large-n variant of the low-data regime: train on a fixed pool of
+    # train_n inputs sampled uniformly (pool_seed). Held-out eval uses
+    # eval_n fresh inputs (disjoint from the pool w.h.p. for n_wires >~ 30);
+    # per_out_loss/acc report the held-out set, plus _tr/_ho series as with
+    # train_frac. Mutually exclusive with train_frac.
+    train_n: int | None = None
     # "iid": each batch drawn from the pool with replacement. "epoch":
     # pass through the pool in a per-epoch shuffled order, so every sample
     # is seen exactly once per epoch (steps = epochs * n_pool / batch;
@@ -129,6 +135,9 @@ class RunConfig:
             s += f"_c{self.n_wires}x{self.circ_depth}"
         if self.train_frac is not None:
             s += f"_tf{self.train_frac:g}"
+        if self.train_n is not None:
+            s += f"_tn{self.train_n}"
+        if self.train_frac is not None or self.train_n is not None:
             if self.pool_seed != 0:
                 s += f"ps{self.pool_seed}"
             if self.data_order != "iid":
@@ -224,8 +233,10 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         raise ValueError(f"unknown noise_scale {cfg.noise_scale!r}")
     if cfg.data_order not in ("iid", "epoch"):
         raise ValueError(f"unknown data_order {cfg.data_order!r}")
-    if cfg.data_order == "epoch" and cfg.train_frac is None:
-        raise ValueError("data_order='epoch' requires train_frac")
+    if cfg.train_frac is not None and cfg.train_n is not None:
+        raise ValueError("train_frac and train_n are mutually exclusive")
+    if cfg.data_order == "epoch" and cfg.train_frac is None and cfg.train_n is None:
+        raise ValueError("data_order='epoch' requires train_frac or train_n")
     if cfg.npz_path.exists():
         if not quiet:
             print(f"[skip] {cfg.name} (done)")
@@ -266,9 +277,14 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         pool_idx = np.sort(np.random.default_rng(cfg.pool_seed)
                            .choice(n_all, n_pool, replace=False))
         train_x = jnp.asarray(all_x[pool_idx])
-        if cfg.data_order == "epoch" and n_pool % cfg.batch:
-            raise ValueError(f"data_order='epoch' needs batch | n_pool "
-                             f"({cfg.batch} does not divide {n_pool})")
+    elif cfg.train_n is not None:
+        n_pool = cfg.train_n
+        train_x = jnp.asarray(np.random.default_rng(cfg.pool_seed).integers(
+            0, 2, size=(n_pool, cfg.n_wires), dtype=np.uint8))
+    pooled = cfg.train_frac is not None or cfg.train_n is not None
+    if pooled and cfg.data_order == "epoch" and n_pool % cfg.batch:
+        raise ValueError(f"data_order='epoch' needs batch | n_pool "
+                         f"({cfg.batch} does not divide {n_pool})")
 
     if cfg.ckpt_path.exists():
         with open(cfg.ckpt_path, "rb") as f:
@@ -293,7 +309,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
             "per_out_acc": [],
             "wall_time": 0.0,
         }
-        if cfg.train_frac is not None:
+        if pooled:
             for k in ("per_out_loss_tr", "per_out_acc_tr",
                       "per_out_loss_ho", "per_out_acc_ho"):
                 st[k] = []
@@ -301,7 +317,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     @jax.jit
     def train_step(params, opt_state, step):
         key = jax.random.fold_in(data_key, step)
-        if cfg.train_frac is None:
+        if not pooled:
             x = jax.random.bernoulli(
                 key, shape=(cfg.batch, cfg.n_wires)
             ).astype(jnp.uint8)
@@ -336,16 +352,25 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
             params = add_noise(params)
         return params, opt_state, loss
 
-    if cfg.train_frac is None:
+    if not pooled:
         eval_x = jax.random.bernoulli(
             jax.random.key(cfg.eval_seed), shape=(cfg.eval_n, cfg.n_wires)
         ).astype(jnp.uint8)
-    else:
+    elif cfg.train_frac is not None:
         eval_x = jnp.asarray(all_x)  # full enumeration; _tr/_ho split it
         in_pool = np.zeros(n_all, dtype=bool)
         in_pool[pool_idx] = True
         tr_w = jnp.asarray(in_pool, dtype=jnp.float32)
         ho_w = jnp.asarray(~in_pool, dtype=jnp.float32)
+    else:  # train_n: eval on the pool plus eval_n fresh held-out inputs
+        ho_x = jax.random.bernoulli(
+            jax.random.key(cfg.eval_seed), shape=(cfg.eval_n, cfg.n_wires)
+        ).astype(jnp.uint8)
+        eval_x = jnp.concatenate([train_x, ho_x])
+        w = np.zeros(n_pool + cfg.eval_n, dtype=np.float32)
+        w[:n_pool] = 1.0
+        tr_w = jnp.asarray(w)
+        ho_w = jnp.asarray(1.0 - w)
     eval_y = circ_eval(eval_x).astype(jnp.float32)
 
     @jax.jit
@@ -353,14 +378,17 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         logits = forward(params, eval_x)
         pel = jax.nn.softplus(logits) - logits * eval_y  # per-example BCE
         acc = ((logits > 0) == (eval_y > 0.5)).astype(jnp.float32)
-        out = [jnp.mean(pel, axis=0), jnp.mean(acc, axis=0)]
-        if cfg.train_frac is not None:
+        if cfg.train_n is None:
+            out = [jnp.mean(pel, axis=0), jnp.mean(acc, axis=0)]
+        else:  # headline series = held-out only (the pool would dilute it)
+            out = [(ho_w @ pel) / ho_w.sum(), (ho_w @ acc) / ho_w.sum()]
+        if pooled:
             for w in (tr_w, ho_w):
                 out += [(w @ pel) / w.sum(), (w @ acc) / w.sum()]
         return out
 
     eval_keys = ["per_out_loss", "per_out_acc"]
-    if cfg.train_frac is not None:
+    if pooled:
         eval_keys += ["per_out_loss_tr", "per_out_acc_tr",
                       "per_out_loss_ho", "per_out_acc_ho"]
 
@@ -448,7 +476,8 @@ def main():
         ("output_wires", lambda s: tuple(int(x) for x in s.split(","))),
         ("optimizer", str), ("weight_decay", float), ("momentum", float),
         ("task", str),
-        ("train_frac", float), ("pool_seed", int), ("data_order", str),
+        ("train_frac", float), ("train_n", int), ("pool_seed", int),
+        ("data_order", str),
         ("weight_noise", float), ("noise_mode", str), ("noise_scale", str),
         ("init_scale", float), ("adam_eps", float),
         ("save_params", lambda s: s.lower() in ("1", "true", "yes")),
