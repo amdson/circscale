@@ -93,6 +93,14 @@ BATCHES: dict[str, list[dict]] = {
                        optimizer="adamw", weight_decay=0.01),
                   dict(width=256, mlp_depth=6, lr=1e-3, steps=30_000, weight_noise=0.3, adam_eps=1e-4),
                   dict(width=256, mlp_depth=6, lr=1e-3, steps=30_000, weight_noise=0.3, noise_scale="rms")],
+    # candidate recipe at depth: noise 0.5 + adam_eps 1e-4 + lr 1e-3, seeds
+    "deep_eps_a": [dict(width=512, mlp_depth=8, lr=1e-3, steps=30_000, weight_noise=0.5,
+                        adam_eps=1e-4, model_seed=s) for s in [0, 1]],
+    "deep_eps_b": [dict(width=360, mlp_depth=7, lr=1e-3, steps=30_000, weight_noise=0.5,
+                        adam_eps=1e-4, model_seed=s) for s in [1, 2]],
+    "deep_eps_c": [dict(width=256, mlp_depth=6, lr=1e-3, steps=30_000, weight_noise=0.5,
+                        adam_eps=1e-4, model_seed=s) for s in [0, 1]]
+                  + _grid(train_frac=[0.3], weight_noise=[0.5, 1.0], adam_eps=[1e-4], model_seed=SEEDS),
     "deep_seeds": [dict(width=512, mlp_depth=8, lr=1e-3, weight_noise=wn, model_seed=s)
                    for wn in [0.0, 0.5] for s in [1, 2]],
 }
