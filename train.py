@@ -62,10 +62,12 @@ class RunConfig:
     # noise_scale — "init": weight_noise is a dimensionless ratio; each leaf
     #   gets std weight_noise * (its init std), keeping the function-space
     #   perturbation width-invariant (norm scales get none). "abs":
-    #   weight_noise is the raw per-parameter std for every leaf.
+    #   weight_noise is the raw per-parameter std for every leaf. "rms":
+    #   like "init" but relative to each leaf's *current* RMS (stop-grad), so
+    #   the regularizer does not weaken as weights grow (scale-free).
     weight_noise: float = 0.0
     noise_mode: str = "transient"  # "transient" | "persist"
-    noise_scale: str = "init"      # "init" | "abs"
+    noise_scale: str = "init"      # "init" | "abs" | "rms"
     # circuit / seeds
     task: str = "brickwork"  # "brickwork" | "tree3" (n_wires = 3^circ_depth leaves)
     n_wires: int = 256
@@ -103,8 +105,8 @@ class RunConfig:
             s += f"_eps{self.adam_eps:g}"
         if self.init_scale != 1.0:
             s += f"_is{self.init_scale:g}"
-        if self.weight_noise:  # "wnr" = init-relative, "wn" = absolute; "p" = persist
-            tag = "wnr" if self.noise_scale == "init" else "wn"
+        if self.weight_noise:  # "wnr" = init-relative, "wn" = absolute, "wnm" = rms-relative; "p" = persist
+            tag = {"init": "wnr", "abs": "wn", "rms": "wnm"}[self.noise_scale]
             s += f"_{tag}{self.weight_noise:g}" + ("p" if self.noise_mode == "persist" else "")
         if self.task != "brickwork":
             s += f"_{self.task}"
@@ -176,7 +178,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     resumes it."""
     if cfg.noise_mode not in ("transient", "persist"):
         raise ValueError(f"unknown noise_mode {cfg.noise_mode!r}")
-    if cfg.noise_scale not in ("init", "abs"):
+    if cfg.noise_scale not in ("init", "abs", "rms"):
         raise ValueError(f"unknown noise_scale {cfg.noise_scale!r}")
     if cfg.npz_path.exists():
         if not quiet:
@@ -204,9 +206,9 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     data_key = jax.random.key(cfg.model_seed if cfg.data_seed is None else cfg.data_seed)
     noise_key = jax.random.split(data_key)[0]  # stream independent of the batch keys
     noise_stds = jax.tree_util.tree_leaves(
-        init_stds(mlp_cfg) if cfg.noise_scale == "init"
+        init_stds(mlp_cfg) if cfg.noise_scale in ("init", "rms")
         else jax.tree_util.tree_map(lambda _: 1.0, init_stds(mlp_cfg))
-    )
+    )  # for "rms" these only mark which leaves get noise (init std > 0)
 
     if cfg.train_frac is not None:
         if cfg.n_wires > 16:
@@ -263,8 +265,12 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         def add_noise(p_tree):
             leaves, tdef = jax.tree_util.tree_flatten(p_tree)
             keys = jax.random.split(jax.random.fold_in(noise_key, step), len(leaves))
+            def std(p, s):
+                if cfg.noise_scale != "rms" or s == 0.0:
+                    return s
+                return jax.lax.stop_gradient(jnp.sqrt(jnp.mean(p * p)))
             return jax.tree_util.tree_unflatten(tdef, [
-                p + cfg.weight_noise * s * jax.random.normal(k, p.shape, p.dtype)
+                p + cfg.weight_noise * std(p, s) * jax.random.normal(k, p.shape, p.dtype)
                 for p, s, k in zip(leaves, noise_stds, keys)
             ])
 

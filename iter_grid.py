@@ -79,6 +79,22 @@ BATCHES: dict[str, list[dict]] = {
     "lr": _grid(lr=[1e-3, 1e-2], weight_noise=[0.0, 0.5], model_seed=SEEDS),
     "pools": _grid(pool_seed=[1, 2], weight_noise=[0.0, 0.5], model_seed=SEEDS),
     "long": _grid(steps=[50_000], weight_noise=[0.3, 0.5, 1.0], model_seed=[0, 1]),
+    # deep shapes: does the noise recipe need only a lower lr / longer horizon?
+    "deep": [dict(width=w, mlp_depth=d, lr=1e-3, steps=30_000, weight_noise=wn)
+             for w, d in [(256, 6), (360, 7), (512, 8)] for wn in [0.3, 0.5]],
+    # late-collapse fixes (Adam eps, rms-relative noise, wd) on long horizons
+    "stab": (_grid(steps=[50_000], weight_noise=[0.5], adam_eps=[1e-6, 1e-4], model_seed=[0, 1])
+             + _grid(steps=[50_000], weight_noise=[0.5], noise_scale=["rms"], model_seed=[0, 1])
+             + _grid(steps=[50_000], weight_noise=[0.5], optimizer=["adamw"],
+                     weight_decay=[0.01], model_seed=[0, 1])),
+    "deep_stab": [dict(width=360, mlp_depth=7, lr=1e-3, steps=30_000, weight_noise=0.5, adam_eps=1e-4),
+                  dict(width=360, mlp_depth=7, lr=1e-3, steps=30_000, weight_noise=0.5, noise_scale="rms"),
+                  dict(width=360, mlp_depth=7, lr=1e-3, steps=30_000, weight_noise=0.5,
+                       optimizer="adamw", weight_decay=0.01),
+                  dict(width=256, mlp_depth=6, lr=1e-3, steps=30_000, weight_noise=0.3, adam_eps=1e-4),
+                  dict(width=256, mlp_depth=6, lr=1e-3, steps=30_000, weight_noise=0.3, noise_scale="rms")],
+    "deep_seeds": [dict(width=512, mlp_depth=8, lr=1e-3, weight_noise=wn, model_seed=s)
+                   for wn in [0.0, 0.5] for s in [1, 2]],
 }
 
 
