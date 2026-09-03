@@ -52,6 +52,12 @@ class RunConfig:
     optimizer: str = "adam"     # "adam" | "adamw" | "sgd"
     adam_eps: float = 1e-8      # adam/adamw; raising it (1e-4-ish) tames spikes
     weight_decay: float = 0.0   # adamw (decoupled) and sgd (classic L2-style)
+    decay_norms: bool = True    # False: decay weight matrices only (norm gains exempt)
+    # "const": one decay rate for every leaf. "init": per-leaf rate
+    # weight_decay * (std_w1 / std_leaf)^2, i.e. a Gaussian prior whose
+    # variance is each leaf's init variance (w1 gets exactly weight_decay;
+    # small-init leaves such as w2 are decayed harder). Implies decay_norms=False.
+    wd_scale: str = "const"     # "const" | "init"
     momentum: float = 0.9       # sgd only; 0 = vanilla SGD
     # Gaussian weight-noise regularizer (0 disables).
     # noise_mode — "transient": perturb weights for the forward/backward only,
@@ -62,10 +68,12 @@ class RunConfig:
     # noise_scale — "init": weight_noise is a dimensionless ratio; each leaf
     #   gets std weight_noise * (its init std), keeping the function-space
     #   perturbation width-invariant (norm scales get none). "abs":
-    #   weight_noise is the raw per-parameter std for every leaf.
+    #   weight_noise is the raw per-parameter std for every leaf. "rms":
+    #   like "init" but relative to each leaf's *current* RMS (stop-grad), so
+    #   the regularizer does not weaken as weights grow (scale-free).
     weight_noise: float = 0.0
     noise_mode: str = "transient"  # "transient" | "persist"
-    noise_scale: str = "init"      # "init" | "abs"
+    noise_scale: str = "init"      # "init" | "abs" | "rms"
     # circuit / seeds
     task: str = "brickwork"  # "brickwork" | "tree3" (n_wires = 3^circ_depth leaves)
     n_wires: int = 256
@@ -93,6 +101,7 @@ class RunConfig:
     eval_n: int = 4000
     checkpoint_every: int = 2500
     out_dir: str = "runs"
+    save_params: bool = False  # also write <name>.params.pkl at the end (not in name)
 
     @property
     def name(self) -> str:
@@ -103,12 +112,16 @@ class RunConfig:
             s += f"_{self.optimizer}wd{self.weight_decay:g}"
             if self.optimizer == "sgd" and self.momentum != 0.9:
                 s += f"m{self.momentum:g}"
+            if self.wd_scale == "init":
+                s += "i"
+            elif not self.decay_norms:
+                s += "wm"
         if self.adam_eps != 1e-8 and self.optimizer in ("adam", "adamw"):
             s += f"_eps{self.adam_eps:g}"
         if self.init_scale != 1.0:
             s += f"_is{self.init_scale:g}"
-        if self.weight_noise:  # "wnr" = init-relative, "wn" = absolute; "p" = persist
-            tag = "wnr" if self.noise_scale == "init" else "wn"
+        if self.weight_noise:  # "wnr" = init-relative, "wn" = absolute, "wnm" = rms-relative; "p" = persist
+            tag = {"init": "wnr", "abs": "wn", "rms": "wnm"}[self.noise_scale]
             s += f"_{tag}{self.weight_noise:g}" + ("p" if self.noise_mode == "persist" else "")
         if self.task != "brickwork":
             s += f"_{self.task}"
@@ -135,6 +148,10 @@ class RunConfig:
     def ckpt_path(self) -> Path:
         return Path(self.out_dir) / f"{self.name}.ckpt.pkl"
 
+    @property
+    def params_path(self) -> Path:
+        return Path(self.out_dir) / f"{self.name}.params.pkl"
+
 
 def _make_schedule(cfg: RunConfig):
     if cfg.schedule == "constant":
@@ -150,17 +167,30 @@ def _make_schedule(cfg: RunConfig):
     raise ValueError(f"unknown schedule {cfg.schedule!r}")
 
 
-def _make_opt(cfg: RunConfig):
+def _make_opt(cfg: RunConfig, mlp_cfg: MLPConfig | None = None):
     sched = _make_schedule(cfg)
+    mask = None
+    stds = init_stds(mlp_cfg)
+    if not cfg.decay_norms or cfg.wd_scale == "init":  # only leaves with init std > 0
+        mask = jax.tree_util.tree_map(lambda s: s > 0, stds)
+    if cfg.wd_scale == "init":
+        ref = stds["blocks"]["w1"] ** 2
+        rates = jax.tree_util.tree_map(
+            lambda s: cfg.weight_decay * ref / (s * s) if s > 0 else 0.0, stds)
+        decay = optax.stateless(lambda upd, params: jax.tree_util.tree_map(
+            lambda u, p, d: u + d * p, upd, params, rates))
+    elif cfg.wd_scale == "const":
+        decay = optax.add_decayed_weights(cfg.weight_decay, mask=mask)
+    else:
+        raise ValueError(f"unknown wd_scale {cfg.wd_scale!r}")
     if cfg.optimizer == "adam":
         return optax.adam(sched, eps=cfg.adam_eps)
-    if cfg.optimizer == "adamw":
-        return optax.adamw(sched, eps=cfg.adam_eps, weight_decay=cfg.weight_decay)
-    if cfg.optimizer == "sgd":
+    if cfg.optimizer == "adamw":  # = optax.adamw with a per-leaf decay stage
         return optax.chain(
-            optax.add_decayed_weights(cfg.weight_decay),
-            optax.sgd(sched, momentum=cfg.momentum or None),
-        )
+            optax.scale_by_adam(eps=cfg.adam_eps), decay,
+            optax.scale_by_learning_rate(sched))
+    if cfg.optimizer == "sgd":
+        return optax.chain(decay, optax.sgd(sched, momentum=cfg.momentum or None))
     raise ValueError(f"unknown optimizer {cfg.optimizer!r}")
 
 
@@ -190,7 +220,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
     resumes it."""
     if cfg.noise_mode not in ("transient", "persist"):
         raise ValueError(f"unknown noise_mode {cfg.noise_mode!r}")
-    if cfg.noise_scale not in ("init", "abs"):
+    if cfg.noise_scale not in ("init", "abs", "rms"):
         raise ValueError(f"unknown noise_scale {cfg.noise_scale!r}")
     if cfg.data_order not in ("iid", "epoch"):
         raise ValueError(f"unknown data_order {cfg.data_order!r}")
@@ -217,14 +247,14 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         n_inputs=cfg.n_wires, n_outputs=n_out,
         width=cfg.width, depth=cfg.mlp_depth, hidden_ratio=cfg.hidden_ratio,
     )
-    opt = _make_opt(cfg)
+    opt = _make_opt(cfg, mlp_cfg)
     wire_mask = None if cfg.output_wires is None else jnp.asarray(cfg.output_wires)
     data_key = jax.random.key(cfg.model_seed if cfg.data_seed is None else cfg.data_seed)
     noise_key = jax.random.split(data_key)[0]  # stream independent of the batch keys
     noise_stds = jax.tree_util.tree_leaves(
-        init_stds(mlp_cfg) if cfg.noise_scale == "init"
+        init_stds(mlp_cfg) if cfg.noise_scale in ("init", "rms")
         else jax.tree_util.tree_map(lambda _: 1.0, init_stds(mlp_cfg))
-    )
+    )  # for "rms" these only mark which leaves get noise (init std > 0)
 
     if cfg.train_frac is not None:
         if cfg.n_wires > 16:
@@ -254,6 +284,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         st = {
             "step": 0,
             "param_norm": [],
+            "leaf_norms": [],
             "params": params,
             "opt_state": opt.init(params),
             "train_loss": np.zeros(cfg.steps, dtype=np.float32),
@@ -286,8 +317,12 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         def add_noise(p_tree):
             leaves, tdef = jax.tree_util.tree_flatten(p_tree)
             keys = jax.random.split(jax.random.fold_in(noise_key, step), len(leaves))
+            def std(p, s):
+                if cfg.noise_scale != "rms" or s == 0.0:
+                    return s
+                return jax.lax.stop_gradient(jnp.sqrt(jnp.mean(p * p)))
             return jax.tree_util.tree_unflatten(tdef, [
-                p + cfg.weight_noise * s * jax.random.normal(k, p.shape, p.dtype)
+                p + cfg.weight_noise * std(p, s) * jax.random.normal(k, p.shape, p.dtype)
                 for p, s, k in zip(leaves, noise_stds, keys)
             ])
 
@@ -336,9 +371,10 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         for k, v in zip(eval_keys, jax.device_get(evaluate(st["params"]))):
             st[k].append(v)
         if "param_norm" in st:  # absent when resuming pre-param_norm checkpoints
-            st["param_norm"].append(float(np.sqrt(sum(
-                float(jnp.vdot(p, p))
-                for p in jax.tree_util.tree_leaves(st["params"])))))
+            sq = [float(jnp.vdot(p, p)) for p in jax.tree_util.tree_leaves(st["params"])]
+            st["param_norm"].append(float(np.sqrt(sum(sq))))
+            if "leaf_norms" in st:
+                st["leaf_norms"].append(np.sqrt(sq))
 
     start, t0, executed = st["step"], time.perf_counter(), 0
     pbar = tqdm(range(start, cfg.steps), initial=start, total=cfg.steps,
@@ -370,6 +406,9 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         arrays["train_pool"] = pool_idx
     if st.get("param_norm"):
         arrays["param_norm"] = np.array(st["param_norm"], dtype=np.float32)
+    if st.get("leaf_norms"):  # (T, n_leaves) in tree_leaves order:
+        # embed, norm_scale, w1, w2, final_norm_scale, head
+        arrays["leaf_norms"] = np.array(st["leaf_norms"], dtype=np.float32)
     np.savez_compressed(
         cfg.npz_path,
         config=json.dumps(asdict(cfg)),
@@ -379,6 +418,9 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         wall_time=st["wall_time"],
         **arrays,
     )
+    if cfg.save_params:
+        with open(cfg.params_path, "wb") as f:
+            pickle.dump(jax.device_get(st["params"]), f)
     cfg.ckpt_path.unlink(missing_ok=True)
     if not quiet:
         # summarize over the trained wires only, so the number matches the task
@@ -409,6 +451,9 @@ def main():
         ("train_frac", float), ("pool_seed", int), ("data_order", str),
         ("weight_noise", float), ("noise_mode", str), ("noise_scale", str),
         ("init_scale", float), ("adam_eps", float),
+        ("save_params", lambda s: s.lower() in ("1", "true", "yes")),
+        ("decay_norms", lambda s: s.lower() in ("1", "true", "yes")),
+        ("wd_scale", str),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)
