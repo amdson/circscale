@@ -83,6 +83,11 @@ class RunConfig:
     # (_ho) per-output series. None = online training on fresh samples.
     train_frac: float | None = None
     pool_seed: int = 0
+    # "iid": each batch drawn from the pool with replacement. "epoch":
+    # pass through the pool in a per-epoch shuffled order, so every sample
+    # is seen exactly once per epoch (steps = epochs * n_pool / batch;
+    # requires train_frac, and batch must divide the pool size).
+    data_order: str = "iid"
     # eval / io
     eval_every: int = 500
     eval_n: int = 4000
@@ -113,6 +118,8 @@ class RunConfig:
             s += f"_tf{self.train_frac:g}"
             if self.pool_seed != 0:
                 s += f"ps{self.pool_seed}"
+            if self.data_order != "iid":
+                s += f"_{self.data_order}"
         if self.output_wires is not None:
             ow = "-".join(map(str, self.output_wires))
             if len(self.output_wires) > 12:
@@ -157,6 +164,18 @@ def _make_opt(cfg: RunConfig):
     raise ValueError(f"unknown optimizer {cfg.optimizer!r}")
 
 
+def _epoch_indices(data_key, step: int, batch: int, n_pool: int):
+    """Pool indices for one batch under "epoch" ordering: a fresh shuffle of
+    the pool per epoch, consumed sequentially — each sample appears exactly
+    once per epoch. Works under jit with a traced step."""
+    import jax
+
+    epoch = (step * batch) // n_pool
+    offset = (step * batch) % n_pool
+    perm = jax.random.permutation(jax.random.fold_in(data_key, epoch), n_pool)
+    return jax.lax.dynamic_slice(perm, (offset,), (batch,))
+
+
 def _save_ckpt(path: Path, state: dict) -> None:
     tmp = path.with_suffix(".tmp")
     with open(tmp, "wb") as f:
@@ -173,6 +192,10 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         raise ValueError(f"unknown noise_mode {cfg.noise_mode!r}")
     if cfg.noise_scale not in ("init", "abs"):
         raise ValueError(f"unknown noise_scale {cfg.noise_scale!r}")
+    if cfg.data_order not in ("iid", "epoch"):
+        raise ValueError(f"unknown data_order {cfg.data_order!r}")
+    if cfg.data_order == "epoch" and cfg.train_frac is None:
+        raise ValueError("data_order='epoch' requires train_frac")
     if cfg.npz_path.exists():
         if not quiet:
             print(f"[skip] {cfg.name} (done)")
@@ -213,6 +236,9 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         pool_idx = np.sort(np.random.default_rng(cfg.pool_seed)
                            .choice(n_all, n_pool, replace=False))
         train_x = jnp.asarray(all_x[pool_idx])
+        if cfg.data_order == "epoch" and n_pool % cfg.batch:
+            raise ValueError(f"data_order='epoch' needs batch | n_pool "
+                             f"({cfg.batch} does not divide {n_pool})")
 
     if cfg.ckpt_path.exists():
         with open(cfg.ckpt_path, "rb") as f:
@@ -248,8 +274,10 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
             x = jax.random.bernoulli(
                 key, shape=(cfg.batch, cfg.n_wires)
             ).astype(jnp.uint8)
-        else:
+        elif cfg.data_order == "iid":
             x = train_x[jax.random.randint(key, (cfg.batch,), 0, n_pool)]
+        else:  # "epoch": every pool sample exactly once per epoch
+            x = train_x[_epoch_indices(data_key, step, cfg.batch, n_pool)]
         y = circ_eval(x).astype(jnp.float32)
         def loss_fn(p):
             pol = per_output_bce(forward(p, x), y)
@@ -378,7 +406,7 @@ def main():
         ("output_wires", lambda s: tuple(int(x) for x in s.split(","))),
         ("optimizer", str), ("weight_decay", float), ("momentum", float),
         ("task", str),
-        ("train_frac", float), ("pool_seed", int),
+        ("train_frac", float), ("pool_seed", int), ("data_order", str),
         ("weight_noise", float), ("noise_mode", str), ("noise_scale", str),
         ("init_scale", float), ("adam_eps", float),
     ]:

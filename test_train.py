@@ -67,6 +67,28 @@ def test_train_frac(tmp_path):
     )
 
 
+def test_epoch_order(tmp_path):
+    import jax
+
+    from train import _epoch_indices
+
+    # one epoch's batches exactly partition the pool, and epochs reshuffle
+    key = jax.random.key(7)
+    n_pool, batch = 64, 16
+    ep0 = np.concatenate([np.asarray(_epoch_indices(key, s, batch, n_pool))
+                          for s in range(4)])
+    ep1 = np.concatenate([np.asarray(_epoch_indices(key, s, batch, n_pool))
+                          for s in range(4, 8)])
+    assert sorted(ep0) == list(range(n_pool)) == sorted(ep1)
+    assert not np.array_equal(ep0, ep1)
+
+    cfg = replace(tiny_cfg(tmp_path), n_wires=8, circ_depth=4, train_frac=0.5,
+                  batch=32, steps=8, warmup=0, data_order="epoch")
+    assert "_tf0.5_epoch_" in cfg.name
+    _, d = load_run(run(cfg, quiet=True))  # 8 steps = 2 epochs of 128/32
+    assert np.isfinite(d["train_loss"]).all()
+
+
 def test_weight_noise(tmp_path):
     cfg = tiny_cfg(tmp_path, weight_noise=0.1)
     assert "_wnr0.1_" in cfg.name  # transient + init-relative are the defaults
