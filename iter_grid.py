@@ -148,6 +148,21 @@ BATCHES: dict[str, list[dict]] = {
                     train_frac=[0.25], optimizer=["adamw"], decay_norms=[False],
                     weight_decay=[0.3, 1.0], weight_noise=[1.0],
                     model_seed=[0, 1], out_dir=["runs/scale"], save_params=[True]),
+    "wd2_w512": _grid(width=[512], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                      train_frac=[0.25], optimizer=["adamw"], decay_norms=[False],
+                      weight_decay=[0.3, 1.0], weight_noise=[0.5], noise_scale=["rms"],
+                      model_seed=[0, 1], out_dir=["runs/scale"], save_params=[True])
+                + _grid(width=[512], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                        train_frac=[0.25], optimizer=["adamw"], decay_norms=[False],
+                        weight_decay=[1.0], weight_noise=[0.3], model_seed=[0, 1],
+                        out_dir=["runs/scale"], save_params=[True]),
+    # init-variance-scaled decay (Gaussian prior at init variance) x noise, cheap w128 grid
+    **{f"wdi_w128_{wn:g}": _grid(width=[128], mlp_depth=[4], lr=[1e-3], steps=[20_000],
+                                 adam_eps=[1e-4], train_frac=[0.25], optimizer=["adamw"],
+                                 wd_scale=["init"], weight_decay=[0.01, 0.03, 0.1, 0.3],
+                                 weight_noise=[wn], model_seed=[0, 1],
+                                 out_dir=["runs/scale"], save_params=[True])
+       for wn in [0.5, 1.0]},
     "deep_seeds": [dict(width=512, mlp_depth=8, lr=1e-3, weight_noise=wn, model_seed=s)
                    for wn in [0.0, 0.5] for s in [1, 2]],
 }

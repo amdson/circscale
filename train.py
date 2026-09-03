@@ -53,6 +53,11 @@ class RunConfig:
     adam_eps: float = 1e-8      # adam/adamw; raising it (1e-4-ish) tames spikes
     weight_decay: float = 0.0   # adamw (decoupled) and sgd (classic L2-style)
     decay_norms: bool = True    # False: decay weight matrices only (norm gains exempt)
+    # "const": one decay rate for every leaf. "init": per-leaf rate
+    # weight_decay * (std_w1 / std_leaf)^2, i.e. a Gaussian prior whose
+    # variance is each leaf's init variance (w1 gets exactly weight_decay;
+    # small-init leaves such as w2 are decayed harder). Implies decay_norms=False.
+    wd_scale: str = "const"     # "const" | "init"
     momentum: float = 0.9       # sgd only; 0 = vanilla SGD
     # Gaussian weight-noise regularizer (0 disables).
     # noise_mode — "transient": perturb weights for the forward/backward only,
@@ -102,7 +107,9 @@ class RunConfig:
             s += f"_{self.optimizer}wd{self.weight_decay:g}"
             if self.optimizer == "sgd" and self.momentum != 0.9:
                 s += f"m{self.momentum:g}"
-            if not self.decay_norms:
+            if self.wd_scale == "init":
+                s += "i"
+            elif not self.decay_norms:
                 s += "wm"
         if self.adam_eps != 1e-8 and self.optimizer in ("adam", "adamw"):
             s += f"_eps{self.adam_eps:g}"
@@ -156,18 +163,27 @@ def _make_schedule(cfg: RunConfig):
 def _make_opt(cfg: RunConfig, mlp_cfg: MLPConfig | None = None):
     sched = _make_schedule(cfg)
     mask = None
-    if not cfg.decay_norms:  # decay only leaves with a nonzero init std
-        mask = jax.tree_util.tree_map(lambda s: s > 0, init_stds(mlp_cfg))
+    stds = init_stds(mlp_cfg)
+    if not cfg.decay_norms or cfg.wd_scale == "init":  # only leaves with init std > 0
+        mask = jax.tree_util.tree_map(lambda s: s > 0, stds)
+    if cfg.wd_scale == "init":
+        ref = stds["blocks"]["w1"] ** 2
+        rates = jax.tree_util.tree_map(
+            lambda s: cfg.weight_decay * ref / (s * s) if s > 0 else 0.0, stds)
+        decay = optax.stateless(lambda upd, params: jax.tree_util.tree_map(
+            lambda u, p, d: u + d * p, upd, params, rates))
+    elif cfg.wd_scale == "const":
+        decay = optax.add_decayed_weights(cfg.weight_decay, mask=mask)
+    else:
+        raise ValueError(f"unknown wd_scale {cfg.wd_scale!r}")
     if cfg.optimizer == "adam":
         return optax.adam(sched, eps=cfg.adam_eps)
-    if cfg.optimizer == "adamw":
-        return optax.adamw(sched, eps=cfg.adam_eps, weight_decay=cfg.weight_decay,
-                           mask=mask)
-    if cfg.optimizer == "sgd":
+    if cfg.optimizer == "adamw":  # = optax.adamw with a per-leaf decay stage
         return optax.chain(
-            optax.add_decayed_weights(cfg.weight_decay, mask=mask),
-            optax.sgd(sched, momentum=cfg.momentum or None),
-        )
+            optax.scale_by_adam(eps=cfg.adam_eps), decay,
+            optax.scale_by_learning_rate(sched))
+    if cfg.optimizer == "sgd":
+        return optax.chain(decay, optax.sgd(sched, momentum=cfg.momentum or None))
     raise ValueError(f"unknown optimizer {cfg.optimizer!r}")
 
 
@@ -242,6 +258,7 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         st = {
             "step": 0,
             "param_norm": [],
+            "leaf_norms": [],
             "params": params,
             "opt_state": opt.init(params),
             "train_loss": np.zeros(cfg.steps, dtype=np.float32),
@@ -326,9 +343,10 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         for k, v in zip(eval_keys, jax.device_get(evaluate(st["params"]))):
             st[k].append(v)
         if "param_norm" in st:  # absent when resuming pre-param_norm checkpoints
-            st["param_norm"].append(float(np.sqrt(sum(
-                float(jnp.vdot(p, p))
-                for p in jax.tree_util.tree_leaves(st["params"])))))
+            sq = [float(jnp.vdot(p, p)) for p in jax.tree_util.tree_leaves(st["params"])]
+            st["param_norm"].append(float(np.sqrt(sum(sq))))
+            if "leaf_norms" in st:
+                st["leaf_norms"].append(np.sqrt(sq))
 
     start, t0, executed = st["step"], time.perf_counter(), 0
     pbar = tqdm(range(start, cfg.steps), initial=start, total=cfg.steps,
@@ -360,6 +378,9 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         arrays["train_pool"] = pool_idx
     if st.get("param_norm"):
         arrays["param_norm"] = np.array(st["param_norm"], dtype=np.float32)
+    if st.get("leaf_norms"):  # (T, n_leaves) in tree_leaves order:
+        # embed, norm_scale, w1, w2, final_norm_scale, head
+        arrays["leaf_norms"] = np.array(st["leaf_norms"], dtype=np.float32)
     np.savez_compressed(
         cfg.npz_path,
         config=json.dumps(asdict(cfg)),
@@ -404,6 +425,7 @@ def main():
         ("init_scale", float), ("adam_eps", float),
         ("save_params", lambda s: s.lower() in ("1", "true", "yes")),
         ("decay_norms", lambda s: s.lower() in ("1", "true", "yes")),
+        ("wd_scale", str),
     ]:
         default = getattr(RunConfig, f)
         p.add_argument(f"--{f.replace('_', '-')}", type=t, default=default)

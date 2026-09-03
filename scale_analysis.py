@@ -36,7 +36,8 @@ def main():
         solved = np.flatnonzero(acc_ho >= 0.999)
         tag = {"init": "wnr", "abs": "wn", "rms": "wnm"}[c["noise_scale"]]
         extra = (f"_is{c['init_scale']:g}" if c["init_scale"] != 1 else "") + \
-                (f"_lr{c['lr']:g}" if c["lr"] != 1e-3 else "")
+                (f"_lr{c['lr']:g}" if c["lr"] != 1e-3 else "") + \
+                (f"_wd{c['weight_decay']:g}" if c["optimizer"] == "adamw" else "")
         cells.setdefault((c["width"], c["mlp_depth"], f"{tag}{c['weight_noise']:g}{extra}"), []).append(dict(
             seed=c["model_seed"], logit=logit, ho=ho, y=yy,
             acc=float(((logit > 0) == (yy > 0.5))[ho].mean()),
