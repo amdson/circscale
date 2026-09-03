@@ -163,6 +163,46 @@ BATCHES: dict[str, list[dict]] = {
                                  weight_noise=[wn], model_seed=[0, 1],
                                  out_dir=["runs/scale"], save_params=[True])
        for wn in [0.5, 1.0]},
+    "wdi_w128_hi": _grid(width=[128], mlp_depth=[4], lr=[1e-3], steps=[20_000],
+                         adam_eps=[1e-4], train_frac=[0.25], optimizer=["adamw"],
+                         wd_scale=["init"], weight_decay=[1.0, 3.0],
+                         weight_noise=[0.5, 1.0], model_seed=[0, 1],
+                         out_dir=["runs/scale"], save_params=[True]),
+    "wdi_w64": _grid(width=[64], mlp_depth=[4], lr=[1e-3], steps=[20_000],
+                     adam_eps=[1e-4], train_frac=[0.25], optimizer=["adamw"],
+                     wd_scale=["init"], weight_decay=[0.03, 0.1, 0.3, 1.0],
+                     weight_noise=[1.0], model_seed=[0, 1],
+                     out_dir=["runs/scale"], save_params=[True]),
+    "wd_w512_long": _grid(width=[512], mlp_depth=[4], lr=[1e-3], steps=[60_000],
+                          adam_eps=[1e-4], train_frac=[0.25], optimizer=["adamw"],
+                          decay_norms=[False], weight_decay=[0.3], weight_noise=[1.0],
+                          model_seed=[0, 1], out_dir=["runs/scale"], save_params=[True]),
+    **{f"wdi_w512_{wd:g}": _grid(width=[512], mlp_depth=[4], lr=[1e-3], steps=[20_000],
+                                 adam_eps=[1e-4], train_frac=[0.25], optimizer=["adamw"],
+                                 wd_scale=["init"], weight_decay=[wd], weight_noise=[0.5, 1.0],
+                                 model_seed=[0, 1], out_dir=["runs/scale"], save_params=[True])
+       for wd in [0.03, 0.1, 0.3]},
+    # w512 at lower lr (relative Adam step ~ w128's) with decay scaled to keep lr*wd
+    "wdlr_w512_a": _grid(width=[512], mlp_depth=[4], lr=[3e-4], steps=[20_000], adam_eps=[1e-4],
+                         train_frac=[0.25], optimizer=["adamw"], wd_scale=["init"],
+                         weight_decay=[0.3], weight_noise=[0.5, 1.0], model_seed=[0, 1],
+                         out_dir=["runs/scale"], save_params=[True]),
+    "wdlr_w512_b": _grid(width=[512], mlp_depth=[4], lr=[3e-4], steps=[20_000], adam_eps=[1e-4],
+                         train_frac=[0.25], optimizer=["adamw"], wd_scale=["init"],
+                         weight_decay=[1.0], weight_noise=[0.5, 1.0], model_seed=[0, 1],
+                         out_dir=["runs/scale"], save_params=[True]),
+    "wdlr_w512_c": _grid(width=[512], mlp_depth=[4], lr=[3e-4], steps=[20_000], adam_eps=[1e-4],
+                         train_frac=[0.25], optimizer=["adamw"], decay_norms=[False],
+                         weight_decay=[1.0], weight_noise=[0.5, 1.0], model_seed=[0, 1],
+                         out_dir=["runs/scale"], save_params=[True]),
+    "wd_w256": _grid(width=[256], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                     train_frac=[0.25], optimizer=["adamw"], decay_norms=[False],
+                     weight_decay=[0.3], weight_noise=[1.0], model_seed=[0, 1],
+                     out_dir=["runs/scale"], save_params=[True])
+               + _grid(width=[256], mlp_depth=[4], lr=[1e-3], steps=[20_000], adam_eps=[1e-4],
+                       train_frac=[0.25], optimizer=["adamw"], wd_scale=["init"],
+                       weight_decay=[0.1], weight_noise=[0.5], model_seed=[0, 1],
+                       out_dir=["runs/scale"], save_params=[True]),
     "deep_seeds": [dict(width=512, mlp_depth=8, lr=1e-3, weight_noise=wn, model_seed=s)
                    for wn in [0.0, 0.5] for s in [1, 2]],
 }
@@ -276,7 +316,8 @@ def stage_fig(names: list[str]) -> None:
 
     for name in names:
         cs = [c for c in batch_cfgs(name) if c.npz_path.exists()]
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+        fig, axes = plt.subplots(1, 4, figsize=(20, 4.2))
+        leaf_names = ["embed", "norm", "w1", "w2", "fnorm", "head"]
         for i, c in enumerate(cs):
             _, r = load_run(c.npz_path)
             m = r["eval_steps"] > 0
@@ -291,11 +332,18 @@ def stage_fig(names: list[str]) -> None:
             axes[1].plot(s, r["per_out_acc_ho"][m][:, TARGET_WIRE], color=col, lw=1.0)
             if "param_norm" in r:
                 axes[2].plot(s, r["param_norm"][m], color=col, lw=1.0)
+            if "leaf_norms" in r and i < 4:  # per-leaf norm relative to init, first 4 runs
+                ln = r["leaf_norms"][m] / r["leaf_norms"][0]
+                for j, ls in zip([0, 2, 3, 5], ["-", "--", ":", "-."]):
+                    axes[3].plot(s, ln[:, j], ls, color=col, lw=0.9,
+                                 label=f"{leaf_names[j]}" if i == 0 else None)
         axes[0].axhline(CHANCE, color="gray", ls=":", lw=0.6)
         axes[0].set(xscale="log", yscale="log", xlabel="step",
                     ylabel="BCE (dashed=train, solid=held-out)")
         axes[1].set(xscale="log", xlabel="step", ylabel="held-out acc", ylim=(0.4, 1.02))
         axes[2].set(xscale="log", xlabel="step", ylabel="param norm")
+        axes[3].set(xscale="log", yscale="log", xlabel="step", ylabel="leaf norm / init")
+        axes[3].legend(fontsize=6)
         axes[0].legend(fontsize=6)
         fig.suptitle(f"batch {name}")
         fig.tight_layout()
