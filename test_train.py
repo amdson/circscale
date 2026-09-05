@@ -82,6 +82,15 @@ def test_epoch_order(tmp_path):
     assert sorted(ep0) == list(range(n_pool)) == sorted(ep1)
     assert not np.array_equal(ep0, ep1)
 
+    # non-divisible pool: floor(70/16)=4 batches/epoch, no sample repeated
+    # within an epoch, remainder skipped until the next epoch's reshuffle
+    ep0 = np.concatenate([np.asarray(_epoch_indices(key, s, 16, 70))
+                          for s in range(4)])
+    ep1 = np.concatenate([np.asarray(_epoch_indices(key, s, 16, 70))
+                          for s in range(4, 8)])
+    assert len(set(ep0)) == 64 and len(set(ep1)) == 64
+    assert set(ep0) <= set(range(70)) and set(ep0) != set(ep1)
+
     cfg = replace(tiny_cfg(tmp_path), n_wires=8, circ_depth=4, train_frac=0.5,
                   batch=32, steps=8, warmup=0, data_order="epoch")
     assert "_tf0.5_epoch_" in cfg.name

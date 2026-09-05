@@ -99,8 +99,10 @@ class RunConfig:
     train_n: int | None = None
     # "iid": each batch drawn from the pool with replacement. "epoch":
     # pass through the pool in a per-epoch shuffled order, so every sample
-    # is seen exactly once per epoch (steps = epochs * n_pool / batch;
-    # requires train_frac, and batch must divide the pool size).
+    # is seen at most once per epoch (steps = epochs * (n_pool // batch);
+    # requires train_frac or train_n; a remainder that doesn't fill a batch
+    # is skipped that epoch — the next epoch reshuffles, so coverage evens
+    # out over passes).
     data_order: str = "iid"
     # eval / io
     eval_every: int = 500
@@ -205,12 +207,14 @@ def _make_opt(cfg: RunConfig, mlp_cfg: MLPConfig | None = None):
 
 def _epoch_indices(data_key, step: int, batch: int, n_pool: int):
     """Pool indices for one batch under "epoch" ordering: a fresh shuffle of
-    the pool per epoch, consumed sequentially — each sample appears exactly
-    once per epoch. Works under jit with a traced step."""
+    the pool per epoch, consumed sequentially — each sample appears at most
+    once per epoch (a sub-batch remainder is skipped until the reshuffle).
+    Works under jit with a traced step."""
     import jax
 
-    epoch = (step * batch) // n_pool
-    offset = (step * batch) % n_pool
+    per_epoch = n_pool // batch
+    epoch = step // per_epoch
+    offset = (step % per_epoch) * batch
     perm = jax.random.permutation(jax.random.fold_in(data_key, epoch), n_pool)
     return jax.lax.dynamic_slice(perm, (offset,), (batch,))
 
@@ -282,9 +286,9 @@ def run(cfg: RunConfig, stop_after: int | None = None, quiet: bool = False):
         train_x = jnp.asarray(np.random.default_rng(cfg.pool_seed).integers(
             0, 2, size=(n_pool, cfg.n_wires), dtype=np.uint8))
     pooled = cfg.train_frac is not None or cfg.train_n is not None
-    if pooled and cfg.data_order == "epoch" and n_pool % cfg.batch:
-        raise ValueError(f"data_order='epoch' needs batch | n_pool "
-                         f"({cfg.batch} does not divide {n_pool})")
+    if pooled and cfg.data_order == "epoch" and cfg.batch > n_pool:
+        raise ValueError(f"data_order='epoch' needs batch <= pool size "
+                         f"({cfg.batch} > {n_pool})")
 
     if cfg.ckpt_path.exists():
         with open(cfg.ckpt_path, "rb") as f:
